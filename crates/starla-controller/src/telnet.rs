@@ -479,6 +479,11 @@ enum ConnectionState {
     DoCrontab,
     /// EOM_SEEN: the empty line ended the request; nothing more is taken
     EomSeen,
+    /// A newer session has taken over: nothing more is taken, every line is
+    /// a bad command, and the controller closes the session. Not in the
+    /// reference, whose telnetd sends an older session nothing more and
+    /// closes it at once (see [`supersede`]).
+    Superseded,
 }
 
 /// Splits the controller's input into lines as getline_2pty does
@@ -608,7 +613,9 @@ pub async fn handle_connection(
         let read = tokio::select! {
             read = reader.read(&mut raw_buf) => read,
             () = taken_over(&mut atlas) => {
-                debug!("A newer controller session took over, closing this one");
+                if supersede(&mut state, &mut atlas) {
+                    continue;
+                }
                 break;
             }
         };
@@ -630,8 +637,8 @@ pub async fn handle_connection(
             if atlas
                 .as_ref()
                 .is_some_and(|rx| rx.has_changed().unwrap_or(false))
+                && !supersede(&mut state, &mut atlas)
             {
-                debug!("A newer controller session took over, closing this one");
                 break 'session;
             }
             log_received(state, &line);
@@ -710,9 +717,10 @@ pub async fn handle_connection(
                     }
                     state = next;
                 }
-                ConnectionState::EomSeen => {
+                ConnectionState::EomSeen | ConnectionState::Superseded => {
                     // "Just eat all input and return bad command"
-                    // (telnetd.c:1265-1278)
+                    // (telnetd.c:1265-1278), and the same for a superseded
+                    // session, which the reference closes instead
                     reply(&mut writer, BAD_COMMAND).await;
                 }
             }
@@ -732,11 +740,10 @@ pub async fn handle_connection(
 
 /// One controller session at a time, as telnetd's `atlas_ts`
 /// (telnetd.c:243-247): a session that authenticates takes over
-/// (:1112-1124), and an older one is killed on its next pass through the
-/// loop, input or not (`if (ts != atlas_ts) goto kill_session`, :1143, :1234,
-/// :1266). Each authenticated session watches its probe's channel here, and
-/// is over at the next send. Keyed by the address of the session-ID cell, so
-/// each probe (and each test) has its own.
+/// (:1112-1124), and an older one takes nothing more ([`supersede`]). Each
+/// authenticated session watches its probe's channel here, and is taken over
+/// at the next send. Keyed by the address of the session-ID cell, so each
+/// probe (and each test) has its own.
 type AtlasSessions = std::collections::HashMap<usize, tokio::sync::watch::Sender<()>>;
 static ATLAS_SESSIONS: std::sync::LazyLock<std::sync::Mutex<AtlasSessions>> =
     std::sync::LazyLock::new(Default::default);
@@ -754,6 +761,43 @@ fn take_over(
         .or_insert_with(|| tokio::sync::watch::channel(()).0);
     tx.send_replace(());
     tx.subscribe()
+}
+
+/// A newer session has taken over this one: whether this one goes on.
+///
+/// The reference kills an older session on its next pass through the loop,
+/// input or not (`if (ts != atlas_ts) goto kill_session`, telnetd.c:1143,
+/// :1234, :1266). RIPE's controller ends the probe's whole SSH session about
+/// two round trips after the probe closes one of its telnet connections
+/// first. On enodia it opened two at once during bursts of one-offs, and each
+/// time Starla closed the older one, which had already answered its
+/// ONEOFF. That was 12 times on 2026-10-14 and 8 on 2026-10-16, and each
+/// time the controller dropped the session. A local OpenSSH sshd keeps the
+/// session through the same close, so it is RIPE's controller that drops it.
+///
+/// So a session outside a CRONTAB is left for the controller to close. It
+/// takes nothing more and answers every line with BAD_COMMAND. That is
+/// EOM_SEEN's answer for the current session (:1265-1278), not the
+/// reference's for an older one: the reference checks for an older session
+/// before it reads a line, so it reads nothing more from it and sends it
+/// nothing (not even the OK for a request under way) before closing it.
+/// Silence would match those bytes up to the close, but would leave the
+/// controller waiting for that OK. BAD_COMMAND refuses at once, with a reply
+/// the controller already gets from the reference. A session inside a
+/// CRONTAB still closes, as in the reference, and its crontab is never
+/// installed (`fclose(atlas_crontab)`, :1118-1122).
+fn supersede(
+    state: &mut ConnectionState,
+    atlas: &mut Option<tokio::sync::watch::Receiver<()>>,
+) -> bool {
+    *atlas = None;
+    if *state == ConnectionState::DoCrontab {
+        debug!("A newer controller session took over, closing this one");
+        return false;
+    }
+    debug!("A newer controller session took over; this one is left for the controller to close");
+    *state = ConnectionState::Superseded;
+    true
 }
 
 /// Resolves when a newer session has taken over; never before this one has
@@ -806,8 +850,9 @@ async fn forward(command_tx: &Option<mpsc::Sender<TelnetCommand>>, command: Teln
 /// tracing field, which the journal would print there). The empty line and
 /// what follows it are logged otherwise: under that text the replay would
 /// send two empty lines, the second drawing a BAD_COMMAND from both probes.
+/// So is what a superseded session gets, which the reference never reads.
 fn log_received(state: ConnectionState, line: &str) {
-    use ConnectionState::{DoCrontab, EomSeen, GetCmd, GetLoginName, GetPassword};
+    use ConnectionState::{DoCrontab, EomSeen, GetCmd, GetLoginName, GetPassword, Superseded};
     match state {
         GetLoginName => debug!("Telnet state {:?}, received: '{}'", state, line),
         // The session ID stays out of the log
@@ -815,6 +860,7 @@ fn log_received(state: ConnectionState, line: &str) {
         GetCmd | DoCrontab if line.is_empty() => debug!("Telnet: end of request"),
         GetCmd | DoCrontab => debug!("Telnet state Authenticated, received: '{}'", line),
         EomSeen => debug!("Telnet: after the end of request, received: '{}'", line),
+        Superseded => debug!("Telnet: superseded session, received: '{}'", line),
     }
 }
 
