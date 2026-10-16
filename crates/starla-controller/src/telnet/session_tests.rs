@@ -533,41 +533,107 @@ async fn authenticate(session: &mut Open) {
     );
 }
 
+/// What `session`'s controller reads once it has sent `input` and closed
+/// its side: all the probe wrote, which ends only when the probe's side
+/// closes too.
+async fn close_with(session: &mut Open, input: &str) -> String {
+    // The probe may have closed first
+    let _ = session.controller.write_all(input.as_bytes()).await;
+    let _ = session.controller.shutdown().await;
+    let mut out = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        session.controller.read_to_end(&mut out),
+    )
+    .await
+    .expect("the probe closes its side once the controller has")
+    .unwrap();
+    // The banner's telnet negotiation is not UTF-8
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[tokio::test]
 async fn a_newer_session_takes_over() {
-    // atlas_ts (telnetd.c:243-247): one controller session at a time. When
-    // another authenticates, the older one is closed on telnetd's next pass,
-    // input or not (:1143, :1234, :1266).
+    // atlas_ts (telnetd.c:243-247): one controller session at a time. The
+    // reference closes the older one on telnetd's next pass (:1143, :1234,
+    // :1266). RIPE's controller drops the probe's whole SSH session when the
+    // probe closes one of its connections first, which happened each time it
+    // opened two at once (enodia, 2026-10-14 and -16). So Starla leaves the
+    // older one for its controller to close; it takes nothing more.
     let probe = Arc::new(tokio::sync::RwLock::new(Some(SID.to_string())));
     let another_probe = Arc::new(tokio::sync::RwLock::new(Some(SID.to_string())));
     let mut first = open(&probe);
     authenticate(&mut first).await;
+    // Its request answered, as RIPE's controller's older session was
+    first.controller.write_all(b"\n").await.unwrap();
     let mut elsewhere = open(&another_probe);
     authenticate(&mut elsewhere).await;
     let mut second = open(&probe);
     authenticate(&mut second).await;
 
-    // The first ends with no further byte from its controller
-    let mut out = Vec::new();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        first.controller.read_to_end(&mut out),
-    )
-    .await
-    .expect("the older session is still open")
-    .unwrap();
-    assert!(out.ends_with(b"\r\nPassword: "));
+    // The first is still open: what its controller sends now is refused,
+    // and it ends when its controller closes it
+    let late = "ONEOFF /home/atlas/crons/oneoff evping -A \"9\" 192.0.2.1";
+    let out = close_with(&mut first, &format!("{late}\n\n")).await;
+    assert!(
+        out.ends_with("\r\nPassword: OK\r\n\r\nBAD_COMMAND\r\n\r\nBAD_COMMAND\r\n\r\n"),
+        "{out:?}"
+    );
     first.handler.await.unwrap().unwrap();
-    assert!(first.commands.recv().await.is_none());
+    assert!(first.commands.recv().await.is_none(), "nothing more taken");
 
     // The newer one carries on, and so does another probe's
     for session in [&mut second, &mut elsewhere] {
-        session.controller.write_all(b"\n").await.unwrap();
-        session.controller.shutdown().await.unwrap();
-        let mut out = Vec::new();
-        session.controller.read_to_end(&mut out).await.unwrap();
-        assert!(out.ends_with(b"\r\nPassword: OK\r\n\r\n"));
+        let out = close_with(session, "\n").await;
+        assert!(out.ends_with("\r\nPassword: OK\r\n\r\n"), "{out:?}");
     }
+}
+
+#[tokio::test]
+async fn a_session_taken_over_mid_request_takes_nothing_more() {
+    // Its ONEOFF taken, its empty line still to come: the reference would
+    // close it with no OK. Starla leaves it open and answers BAD_COMMAND
+    // to all it gets, the end of its request included; none of it is a
+    // request line the twin replays.
+    let probe = Arc::new(tokio::sync::RwLock::new(Some(SID.to_string())));
+    let mut first = open(&probe);
+    authenticate(&mut first).await;
+    Journal::open();
+    let mut second = open(&probe);
+    authenticate(&mut second).await;
+
+    let late = "ONEOFF /home/atlas/crons/oneoff evping -A \"9\" 192.0.2.1";
+    let out = close_with(&mut first, &format!("\n{late}\n")).await;
+    first.handler.await.unwrap().unwrap();
+    let journal = Journal::close();
+    assert!(
+        out.ends_with("\r\nPassword: BAD_COMMAND\r\n\r\nBAD_COMMAND\r\n\r\n"),
+        "{out:?}"
+    );
+    assert!(first.commands.recv().await.is_none(), "nothing more taken");
+    assert!(
+        journal.iter().any(|m| m
+            == "A newer controller session took over; this one is left for the controller to close"),
+        "{journal:#?}"
+    );
+    assert!(
+        journal
+            .iter()
+            .any(|m| *m == format!("Telnet: superseded session, received: '{late}'")),
+        "{journal:#?}"
+    );
+    // The second session's ONEOFF is a request line; the first's late one is not
+    assert_eq!(
+        journal
+            .iter()
+            .filter(|m| m.starts_with("Telnet state Authenticated, received: "))
+            .count(),
+        1,
+        "{journal:#?}"
+    );
+
+    let out = close_with(&mut second, "\n").await;
+    assert!(out.ends_with("\r\nPassword: OK\r\n\r\n"), "{out:?}");
 }
 
 /// The events this thread logs while a journal is open, each as the

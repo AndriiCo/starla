@@ -90,6 +90,26 @@ option the reference does not have.
         enodia-0029 is enodia-0028 and this one commit (445d77b, as
         2aa5504 here); the other commits since enodia-0028 are not
         deployed yet
+  next  telnet: a controller session that a newer one takes over is
+        left for the controller to close (see below); a channel the
+        probe closes first ends with one EOF and one CLOSE. Not
+        deployed yet; it takes the next enodia number when it is
+
+Where it departs from the reference
+-----------------------------------
+Besides 0029's NTP option, one change departs from the reference on
+purpose:
+
+  telnet  a controller session that a newer one takes over is left for
+          the controller to close, and answers whatever else comes on it
+          with BAD_COMMAND; the reference's telnetd sends it nothing more
+          and closes it at once (telnetd.c:1143, :1234, :1266). RIPE's
+          controller drops the probe's whole SSH session when the probe
+          closes one of its telnet connections first, as Starla did each
+          time the controller opened two at once during a burst of
+          one-offs (probe 1018212: 2026-10-14, 2026-10-16, and about
+          once a day from 2026-10-18 to 2026-10-24). One inside a
+          CRONTAB still closes, as there.
 
 Upstream
 --------
