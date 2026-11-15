@@ -119,14 +119,28 @@ mod tests {
     /// What the server received on the channel from the probe, in order
     type Seen = Arc<Mutex<Vec<&'static str>>>;
 
+    /// How the server answers the probe's EOF
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// It does not: it never closes
+        Never,
+        /// Its reply (if any) and its EOF, then its CLOSE once the probe's
+        /// has come (russh's server answers a CLOSE itself)
+        Eof(&'static [u8]),
+        /// As OpenSSH does once the connection it forwards to has replied
+        /// and closed: the reply (if any), its EOF and its CLOSE at once
+        EofClose(&'static [u8]),
+    }
+
     /// The server's end of a channel. It records each EOF and CLOSE the probe
-    /// sends. With an answer, it answers the probe's EOF as OpenSSH does once
-    /// the connection it forwards to has replied and closed: the reply (if
-    /// any), then its EOF and CLOSE. Without one, it never closes. An exec
-    /// gets "pong" and the server's EOF and CLOSE at once.
+    /// sends while the channel is open on the server's side: since russh
+    /// 0.62.5 (GHSA-m65r-rprj-r5rg) its server drops whatever comes for a
+    /// channel after its own CLOSE, so a probe's CLOSE that answers the
+    /// server's never reaches the handler. An exec gets "pong" and the
+    /// server's EOF and CLOSE at once.
     struct Far {
         seen: Seen,
-        answer: Option<&'static [u8]>,
+        answer: Answer,
         channels: Vec<Channel<russh::server::Msg>>,
     }
 
@@ -136,7 +150,7 @@ mod tests {
         async fn auth_publickey(
             &mut self,
             _: &str,
-            _: &russh::keys::PublicKey,
+            _: russh::server::VerifiedPublicKey<'_>,
         ) -> Result<Auth, Self::Error> {
             Ok(Auth::Accept)
         }
@@ -144,10 +158,12 @@ mod tests {
         async fn channel_open_session(
             &mut self,
             channel: Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
             _: &mut Session,
-        ) -> Result<bool, Self::Error> {
+        ) -> Result<(), Self::Error> {
             self.channels.push(channel);
-            Ok(true)
+            reply.accept().await;
+            Ok(())
         }
 
         async fn exec_request(
@@ -169,11 +185,16 @@ mod tests {
             session: &mut Session,
         ) -> Result<(), Self::Error> {
             self.seen.lock().unwrap().push("eof");
-            if let Some(answer) = self.answer {
-                if !answer.is_empty() {
-                    session.data(channel, answer.to_vec())?;
-                }
-                session.eof(channel)?;
+            let (reply, close) = match self.answer {
+                Answer::Never => return Ok(()),
+                Answer::Eof(reply) => (reply, false),
+                Answer::EofClose(reply) => (reply, true),
+            };
+            if !reply.is_empty() {
+                session.data(channel, reply.to_vec())?;
+            }
+            session.eof(channel)?;
+            if close {
                 session.close(channel)?;
             }
             Ok(())
@@ -196,7 +217,7 @@ mod tests {
 
         async fn check_server_key(
             &mut self,
-            _: &russh::keys::PublicKey,
+            _: &russh::keys::PublicKeyOrCertificate,
         ) -> Result<bool, Self::Error> {
             Ok(true)
         }
@@ -205,9 +226,7 @@ mod tests {
     /// A channel to a [`Far`] server over an in-memory wire, what the server
     /// sees the probe send on it, and the session's handle (dropping it
     /// ends the session).
-    async fn channel_to(
-        answer: Option<&'static [u8]>,
-    ) -> (Channel<Msg>, Seen, russh::client::Handle<Near>) {
+    async fn channel_to(answer: Answer) -> (Channel<Msg>, Seen, russh::client::Handle<Near>) {
         let (near, far) = tokio::io::duplex(1 << 16);
         let seen = Seen::default();
         let server = russh::server::Config {
@@ -259,19 +278,55 @@ mod tests {
         seen.lock().unwrap().clone()
     }
 
+    /// What the server has seen a moment after the stream has gone, for a
+    /// channel the server has closed: nothing after its CLOSE can show here
+    async fn settled(seen: &Seen) -> Vec<&'static str> {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        seen.lock().unwrap().clone()
+    }
+
+    /// The SSH session is still up: a new channel's exec gets its "pong".
+    /// RIPE's controller dropped the whole session after a channel close it
+    /// did not like.
+    async fn still_up(handle: &russh::client::Handle<Near>) {
+        let mut channel = handle.channel_open_session().await.unwrap();
+        channel.exec(true, "KEEP").await.unwrap();
+        let mut out = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => out.extend_from_slice(&data),
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        assert_eq!(out, b"pong\n");
+    }
+
     #[tokio::test]
     async fn an_app_that_closes_first_sends_one_eof_and_one_close() {
         // The telnet handler dropping its stream: Starla sent EOF twice and
         // no CLOSE of its own
-        let (channel, seen, _handle) = channel_to(Some(b"")).await;
+        let (channel, seen, handle) = channel_to(Answer::Eof(b"")).await;
         drop(channel_to_stream(channel));
         assert_eq!(closed(&seen).await, ["eof", "close"]);
+        still_up(&handle).await;
+    }
+
+    #[tokio::test]
+    async fn an_app_that_closes_first_sends_one_eof_to_a_server_that_closes_at_once() {
+        // OpenSSH's order: the server's EOF and CLOSE together. russh
+        // answers the CLOSE; the bridge sends nothing more, and the session
+        // stays up.
+        let (channel, seen, handle) = channel_to(Answer::EofClose(b"")).await;
+        drop(channel_to_stream(channel));
+        assert_eq!(settled(&seen).await, ["eof"]);
+        still_up(&handle).await;
     }
 
     #[tokio::test]
     async fn an_app_that_shuts_down_its_side_still_reads_the_reply() {
         // A request and its end, then the server's reply after our EOF
-        let (channel, seen, _handle) = channel_to(Some(b"reply")).await;
+        let (channel, seen, _handle) = channel_to(Answer::Eof(b"reply")).await;
         let mut stream = channel_to_stream(channel);
         stream.write_all(b"request").await.unwrap();
         stream.shutdown().await.unwrap();
@@ -283,7 +338,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_server_that_never_closes_gets_the_close_after_the_grace() {
-        let (channel, seen, _handle) = channel_to(None).await;
+        let (channel, seen, _handle) = channel_to(Answer::Never).await;
         drop(channel_to_stream(channel));
         tokio::time::sleep(CLOSE_GRACE - Duration::from_secs(1)).await;
         assert_eq!(*seen.lock().unwrap(), ["eof"]);
@@ -292,19 +347,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_server_that_closes_first_gets_one_eof_and_one_close_at_most() {
+    async fn a_server_that_closes_first_keeps_the_session() {
         // As the controller ends a telnet connection: its data, EOF and
-        // CLOSE, which russh answers itself
-        let (channel, seen, _handle) = channel_to(None).await;
+        // CLOSE, which russh answers itself. Whatever the bridge sends after
+        // that goes nowhere (russh's client drops a closed channel's EOF and
+        // CLOSE, Encrypted::byte), and the session stays up.
+        let (channel, seen, handle) = channel_to(Answer::Never).await;
         channel.exec(true, "KEEP").await.unwrap();
         let mut stream = channel_to_stream(channel);
         let mut out = Vec::new();
         stream.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, b"pong\n");
         drop(stream);
-        let seen = closed(&seen).await;
-        let eofs = seen.iter().filter(|s| **s == "eof").count();
-        let closes = seen.iter().filter(|s| **s == "close").count();
-        assert!(eofs <= 1 && closes == 1, "{seen:?}");
+        let seen = settled(&seen).await;
+        assert!(
+            seen.iter().filter(|s| **s == "eof").count() <= 1,
+            "{seen:?}"
+        );
+        still_up(&handle).await;
     }
 }

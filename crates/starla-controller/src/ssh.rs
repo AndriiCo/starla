@@ -8,7 +8,9 @@
 
 use russh::client::{self, Handle, Msg};
 use russh::keys::ssh_key::{self, Algorithm};
-use russh::keys::{PrivateKey, PrivateKeyWithHashAlg, PublicKey, PublicKeyBase64};
+use russh::keys::{
+    PrivateKey, PrivateKeyWithHashAlg, PublicKey, PublicKeyBase64, PublicKeyOrCertificate,
+};
 use russh::{Channel, ChannelMsg, Preferred};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -463,11 +465,26 @@ impl client::Handler for AtlasClientHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &PublicKey,
+        server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        self.known_hosts
-            .verify(&self.connect_host, self.connect_port, server_public_key)
-            .await
+        match server_public_key {
+            PublicKeyOrCertificate::PublicKey { key, .. } => {
+                self.known_hosts
+                    .verify(&self.connect_host, self.connect_port, key)
+                    .await
+            }
+            // client_config offers no certificate host-key algorithms
+            // (Preferred::DEFAULT's host_key_certificates is empty), so a
+            // server cannot pick one. known_hosts pins plain keys only, and
+            // there is no CA to check a certificate against: refuse it.
+            PublicKeyOrCertificate::Certificate(_) => {
+                warn!(
+                    "{}:{} presented a host certificate; only pinned host keys are accepted",
+                    self.connect_host, self.connect_port
+                );
+                Ok(false)
+            }
+        }
     }
 
     async fn server_channel_open_forwarded_tcpip(
@@ -477,12 +494,18 @@ impl client::Handler for AtlasClientHandler {
         connected_port: u32,
         originator_address: &str,
         originator_port: u32,
+        reply: client::ChannelOpenHandle,
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
         debug!(
             "Forwarded connection from {}:{} to {}:{}",
             originator_address, originator_port, connected_address, connected_port
         );
+
+        // Since russh 0.62 the handler confirms the channel itself, and a
+        // dropped `reply` rejects it. Confirm before the telnet session can
+        // write on it, as russh 0.61 did on the handler's return.
+        reply.accept().await;
 
         // Convert SSH channel to an async stream and handle directly :
         // no local TCP port needed
@@ -1787,7 +1810,7 @@ mod tests {
         async fn auth_publickey(
             &mut self,
             user: &str,
-            _: &PublicKey,
+            _: russh::server::VerifiedPublicKey<'_>,
         ) -> Result<russh::server::Auth, Self::Error> {
             Ok(if user == "atlas" {
                 russh::server::Auth::Accept
@@ -1799,10 +1822,12 @@ mod tests {
         async fn channel_open_session(
             &mut self,
             channel: Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
             _: &mut russh::server::Session,
-        ) -> Result<bool, Self::Error> {
+        ) -> Result<(), Self::Error> {
             self.channels.push(channel);
-            Ok(true)
+            reply.accept().await;
+            Ok(())
         }
 
         async fn exec_request(
@@ -1882,7 +1907,7 @@ mod tests {
         async fn auth_publickey(
             &mut self,
             _: &str,
-            _: &PublicKey,
+            _: russh::server::VerifiedPublicKey<'_>,
         ) -> Result<russh::server::Auth, Self::Error> {
             std::future::pending().await
         }
@@ -2186,7 +2211,7 @@ mod tests {
         async fn auth_publickey(
             &mut self,
             _: &str,
-            _: &PublicKey,
+            _: russh::server::VerifiedPublicKey<'_>,
         ) -> Result<russh::server::Auth, Self::Error> {
             Ok(russh::server::Auth::Accept)
         }
@@ -2194,10 +2219,12 @@ mod tests {
         async fn channel_open_session(
             &mut self,
             channel: Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
             _: &mut russh::server::Session,
-        ) -> Result<bool, Self::Error> {
+        ) -> Result<(), Self::Error> {
             self.channels.push(channel);
-            Ok(true)
+            reply.accept().await;
+            Ok(())
         }
 
         async fn exec_request(

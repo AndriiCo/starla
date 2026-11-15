@@ -1,8 +1,8 @@
 //! Mock SSH server implementation using russh
 
 use anyhow::Result;
-use russh::keys::ssh_key::{Algorithm, PrivateKey, PublicKey};
-use russh::server::{Auth, Msg, Session};
+use russh::keys::ssh_key::{Algorithm, PrivateKey};
+use russh::server::{Auth, ChannelOpenHandle, Msg, Session, VerifiedPublicKey};
 use russh::{Channel, ChannelId};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -110,17 +110,19 @@ impl russh::server::Handler for SshSession {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         debug!("Channel opened for session: {:?}", channel.id());
         self.channels.insert(channel.id(), channel);
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn auth_publickey(
         &mut self,
         user: &str,
-        _public_key: &PublicKey,
+        _key: VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
         debug!("Public key authentication attempt for user: {}", user);
 
