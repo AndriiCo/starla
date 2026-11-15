@@ -9,10 +9,10 @@ or (at your option) any later version; see LICENSE. These modifications
 are distributed under the same license.
 
   Modified by:  Andrii Tereshchenko
-  Dates:        2026-10-10 to 2026-10-16
+  Dates:        2026-10-10 to 2026-11-15
   Based on:     upstream Starla v0.8.0, commit a374686
   Changes:      the commits on this branch after a374686
-                (git log a374686..enodia-0029)
+                (git log a374686..enodia-0030)
 
 Where this code runs
 --------------------
@@ -21,7 +21,7 @@ It runs RIPE Atlas probe 1018212:
   https://atlas.ripe.net/probes/1018212/
 
 Each version deployed to that probe is tagged here (enodia-<NNNN>). The
-current one is enodia-0029 (445d77b), running since 2026-10-16 09:48 UTC.
+current one is enodia-0030 (b2838f8), running since 2026-11-15 22:24 UTC.
 This branch and its tags are the Corresponding Source for anyone who
 interacts with the probe over the network (AGPL-3.0, section 13).
 
@@ -90,10 +90,11 @@ option the reference does not have.
         enodia-0029 is enodia-0028 and this one commit (445d77b, as
         2aa5504 here); the other commits since enodia-0028 are not
         deployed yet
-  next  telnet: a controller session that a newer one takes over is
+  0030  telnet: a controller session that a newer one takes over is
         left for the controller to close (see below); a channel the
-        probe closes first ends with one EOF and one CLOSE. Not
-        deployed yet; it takes the next enodia number when it is
+        probe closes first ends with one EOF and one CLOSE.
+        enodia-0030 is enodia-0029 and this one commit (b2838f8, as
+        776b7ae here)
 
 Where it departs from the reference
 -----------------------------------
