@@ -874,7 +874,7 @@ mod tests {
                 size: Some(32),
                 data: MeasurementData::Generic(serde_json::json!([{"rtt": 4.2}])),
             },
-            queued_at: 0,
+            queued_at: std::time::Instant::now(),
             attempts: 0,
             last_attempt_at: None,
             lts: -1,

@@ -10,7 +10,7 @@
 
 use starla_common::MeasurementResult;
 use std::collections::VecDeque;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
 /// A queued measurement result with metadata
@@ -18,8 +18,10 @@ use tracing::{debug, warn};
 pub struct QueuedResult {
     /// The measurement result
     pub result: MeasurementResult,
-    /// When this result was queued (unix timestamp)
-    pub queued_at: i64,
+    /// When this result was queued, on the monotonic clock: what its age
+    /// is counted from. The wall clock can step by hours when NTP first
+    /// syncs on a board with no RTC.
+    pub queued_at: Instant,
     /// Number of upload attempts
     pub attempts: u32,
     /// Timestamp of last upload attempt
@@ -79,14 +81,9 @@ impl ResultQueue {
             }
         }
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
         self.items.push_back(QueuedResult {
             result,
-            queued_at: now,
+            queued_at: Instant::now(),
             attempts: 0,
             last_attempt_at: None,
             lts,
@@ -176,19 +173,21 @@ impl ResultQueue {
         over
     }
 
-    /// Remove results older than `max_age_secs`. Returns number of items
-    /// removed.
+    /// Remove results queued `max_age_secs` or more ago, by the monotonic
+    /// clock: a step of the wall clock (NTP's first sync on a board with no
+    /// RTC) ages nothing. Returns number of items removed.
     pub fn cleanup_expired(&mut self, max_age_secs: i64) -> usize {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        self.cleanup_expired_at(Instant::now(), max_age_secs)
+    }
 
+    /// [`cleanup_expired`](Self::cleanup_expired) as of `now`.
+    fn cleanup_expired_at(&mut self, now: Instant, max_age_secs: i64) -> usize {
+        let max_age = Duration::from_secs(max_age_secs.max(0) as u64);
         let before = self.items.len();
         let (mut at, mut moved_removed) = (0, 0);
         let moved = self.moved;
         self.items.retain(|r| {
-            let keep = now - r.queued_at < max_age_secs;
+            let keep = now.saturating_duration_since(r.queued_at) < max_age;
             if !keep && at < moved {
                 moved_removed += 1;
             }
@@ -360,9 +359,11 @@ mod tests {
         q.enqueue(make_result(4)); // drops 1, moved out
         assert_eq!((q.stats().count, q.stats().held), (3, 2));
 
-        q.items[0].queued_at -= 7200; // 2, moved out
-        q.items[1].queued_at -= 7200; // 3, held
-        assert_eq!(q.cleanup_expired(3600), 2);
+        // Two hours on, 2 (moved out) and 3 (held) are past the hour; 4 was
+        // queued just now
+        let later = Instant::now() + Duration::from_secs(7200);
+        q.items[2].queued_at = later;
+        assert_eq!(q.cleanup_expired_at(later, 3600), 2);
         assert_eq!((q.stats().count, q.stats().held), (1, 1));
         assert!(q.drain_moved().is_empty());
 
@@ -370,6 +371,36 @@ mod tests {
         // of their own
         assert_eq!(q.requeue(vec![q.items[0].clone(); 3]), 1);
         assert_eq!((q.stats().count, q.stats().held), (3, 1));
+    }
+
+    /// A result's age is counted on the monotonic clock from when it was
+    /// queued: it goes once max_age has passed there, not before, and its
+    /// wall-clock fields play no part (a forward step of the wall clock,
+    /// NTP's first sync on a board with no RTC, used to age out the whole
+    /// queue at once).
+    #[test]
+    fn results_age_on_the_monotonic_clock() {
+        let mut q = ResultQueue::new(10);
+        q.enqueue(make_result(1));
+        q.enqueue(make_result(2));
+        let queued = q.items[1].queued_at;
+        // The wall clock stamps the attempt and the result; no value of it
+        // ages anything
+        let taken = q.drain_all();
+        assert_eq!(q.requeue(taken), 0);
+        for r in q.items.iter_mut() {
+            r.last_attempt_at = Some(i64::MAX);
+            r.result.timestamp = Timestamp(i64::MAX / 2);
+        }
+
+        assert_eq!(q.cleanup_expired(3600), 0, "just queued");
+        let hour = Duration::from_secs(3600);
+        assert_eq!(
+            q.cleanup_expired_at(queued + hour - Duration::from_secs(1), 3600),
+            0
+        );
+        assert_eq!(q.cleanup_expired_at(queued + hour, 3600), 2);
+        assert_eq!(q.stats().count, 0);
     }
 
     /// A post's results given back to a queue that filled up meanwhile drop
