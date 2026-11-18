@@ -22,7 +22,8 @@
 //! timestamp is one of their T1s. Anyone could otherwise silence a probe's
 //! NTP measurements with forged KoDs, as ntpd's clients could be silenced
 //! until 4.2.8p4 checked the same (NTP bug 2901, CVE-2015-7704). The
-//! report is unchanged: evntp reports every reply, its origin unchecked.
+//! report takes only such replies too ([`super::client`]'s `sample`);
+//! evntp reports every reply, its origin unchecked.
 //!
 //! Holds live in memory; a restart forgets them, at the cost of one run.
 

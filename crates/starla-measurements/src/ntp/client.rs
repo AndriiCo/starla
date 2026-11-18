@@ -195,11 +195,20 @@ fn said(reply: &[u8], header: &NtpHeader, sent: &[u64]) -> super::kod::Said {
 /// ready_callback takes it (ntp.c:870-871, 899-911) — not the time Starla
 /// sent its latest request — and the reply's own header fields. None for a
 /// datagram shorter than a header, which ready_callback skips
-/// (ntp.c:735-740).
-fn sample(reply: &[u8], t4: u64) -> Option<NtpSample> {
+/// (ntp.c:735-740), and for one whose origin timestamp is none of `sent`,
+/// the T1s of the run's requests, which ready_callback takes as a reply:
+/// whoever guesses the run's port and sends from the server's address
+/// would otherwise write the run's rtt and offset. An SNTP client checks
+/// it so (RFC 4330 §5; RFC 5905 §8 calls such a packet bogus). Unlike the
+/// latest-request-only check of RFC 5905, any of the run's T1s will do: a
+/// late reply is still an entry of its own, as ready_callback writes it.
+fn sample(reply: &[u8], t4: u64, sent: &[u64]) -> Option<NtpSample> {
     let header = parse_header(reply)?;
     let mut buf = reply.get(24..48)?;
     let t1 = buf.get_u64();
+    if !sent.contains(&t1) {
+        return None;
+    }
     let t2 = buf.get_u64();
     let t3 = buf.get_u64();
     let (rtt, offset) = delay_and_offset(t1, t2, t3, t4);
@@ -218,10 +227,12 @@ fn sample(reply: &[u8], t4: u64) -> Option<NtpSample> {
 /// server, so the kernel passes up only the server's datagrams
 /// (create_socket, 1255-1274), then `config.count` requests. Each request
 /// sets two timers, `-w` for its reply and `-g` before the next request
-/// (send_pkt, 640-655). Every datagram of a header or more is a reply,
-/// read the moment it comes and stamped just before it is read
-/// (ready_callback, 661-716): it is an entry of its own, its T1 the
-/// origin timestamp it carries, and it cancels the request's timeout. A
+/// (send_pkt, 640-655). Every datagram of a header or more whose origin
+/// timestamp is the T1 of one of the run's requests is a reply, read the
+/// moment it comes and stamped just before it is read (ready_callback,
+/// 661-716): it is an entry of its own, its T1 that origin timestamp, and
+/// it cancels the request's timeout. Any other datagram is read and
+/// skipped, as ready_callback skips a short one (735-740). A
 /// timeout is a `{ "x":"*" }` entry (noreply_callback, 949-963). After a
 /// reply or a timeout the next request goes when the gap has passed, else
 /// when the gap timer fires (gap_callback, 965-972); after the last
@@ -239,7 +250,10 @@ fn sample(reply: &[u8], t4: u64) -> Option<NtpSample> {
 /// any other source was taken the same way. evntp checks neither the mode
 /// nor the origin of a reply: a late one is reported, with its own origin
 /// and so its real delay, in the place of the request then in flight, and
-/// that request's own reply, if it comes, after it.
+/// that request's own reply, if it comes, after it. Starla does that too,
+/// but takes only a reply whose origin is one of the run's T1s (see
+/// `sample`); evntp takes any datagram of 48 bytes or more from the
+/// server's address and port.
 ///
 /// With `kernel_rx_timestamps` on, T4 is the kernel's stamp of the reply's
 /// arrival ([`starla_network::rxstamp`]): wall-clock time, as T4 is.
@@ -361,7 +375,7 @@ async fn run(config: &NtpConfig, kernel_rx: bool) -> anyhow::Result<NtpResult> {
                 errors = 0;
                 // the kernel's, when it stamped the reply
                 let t4 = stamp.map(ntp_ts).unwrap_or(t4);
-                if let Some(sample) = sample(&buf[..len], t4) {
+                if let Some(sample) = sample(&buf[..len], t4, &t1s) {
                     result.said = result.said.and(said(&buf[..len], &sample.header, &t1s));
                     if replies < max_replies {
                         replies += 1;
@@ -731,6 +745,39 @@ mod tests {
         assert_eq!(res.src_addr, Some("127.0.0.1".parse().unwrap()));
     }
 
+    /// A datagram from the server's own address and port whose origin is
+    /// no request's T1 — an off-path spoofer that guessed the run's port,
+    /// with the clock 1000 s ahead — is skipped, and the server's own
+    /// reply after it is the request's answer. evntp takes the first as
+    /// the reply.
+    #[tokio::test]
+    async fn a_reply_with_another_origin_is_not_taken() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 48];
+            let (_, from) = server.recv_from(&mut buf).await.unwrap();
+            let at = now_ntp();
+            let ahead = at + (1000 << 32);
+            let mut spoofed = reply(&buf, ahead, ahead);
+            spoofed[24..32].copy_from_slice(&(at - (1 << 32)).to_be_bytes());
+            server.send_to(&spoofed, from).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            server
+                .send_to(&reply(&buf, at, now_ntp()), from)
+                .await
+                .unwrap();
+        });
+
+        let res = execute_ntp_query(&config(port, 1, 500, 2000))
+            .await
+            .unwrap();
+        assert_eq!(res.samples.len(), 1, "{:?}", res.samples);
+        let s = res.samples[0].as_ref().unwrap();
+        assert!(s.offset.abs() < 1.0, "the spoofed reply was taken: {s:?}");
+        assert!(s.final_ts - s.origin_ts >= 0.05, "{s:?}");
+    }
+
     /// T1 is taken once the socket takes the request, just before its send
     /// (ntp.c:544-564). The run's socket is new to the reactor, so its first
     /// send waits a reactor turn for writable: a run held there 50 ms — a
@@ -884,8 +931,9 @@ mod tests {
     }
 
     /// A KoD whose origin is no request's T1 — forged, or a reply to some
-    /// other client — is reported as evntp reports it, and says nothing to
-    /// the hold; neither does a run that heard nothing.
+    /// other client — is no reply: not reported (evntp reports it) and
+    /// nothing to the hold, and the request times out; neither does a run
+    /// that heard nothing say anything.
     #[tokio::test]
     async fn a_kod_to_no_request_of_the_run_says_nothing() {
         use super::super::kod::Said;
@@ -899,10 +947,9 @@ mod tests {
             server.send_to(&forged, from).await.unwrap();
         });
 
-        let res = execute_ntp_query(&config(port, 1, 500, 50)).await.unwrap();
-        let sample = res.samples[0].as_ref().expect("reported");
-        assert_eq!(sample.header.stratum, 0);
-        assert_eq!(sample.header.ref_id.to_be_bytes(), *b"DENY");
+        let res = execute_ntp_query(&config(port, 1, 200, 50)).await.unwrap();
+        assert_eq!(res.samples.len(), 1);
+        assert!(res.samples[0].is_none(), "{:?}", res.samples);
         assert_eq!(res.said, Said::Nothing);
 
         let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -992,12 +1039,25 @@ mod tests {
     /// Datagrams shorter than a header are skipped (ntp.c:735-740).
     #[test]
     fn a_short_datagram_is_no_reply() {
-        assert!(sample(&[0u8; 47], 0).is_none());
+        let t1 = ts(3_000_000_000.0);
+        assert!(sample(&[0u8; 47], 0, &[0]).is_none());
         assert!(parse_header(&[0u8; 47]).is_none());
         let mut r = [0u8; 48];
-        r[24..32].copy_from_slice(&ts(3_000_000_000.0).to_be_bytes());
+        r[24..32].copy_from_slice(&t1.to_be_bytes());
         r[32..48].copy_from_slice(&[0u8; 16]);
-        let s = sample(&r, ts(3_000_000_000.5)).unwrap();
+        let s = sample(&r, ts(3_000_000_000.5), &[ts(2_999_999_996.0), t1]).unwrap();
         assert_eq!(s.origin_ts, 3_000_000_000.0, "T1 is the reply's origin");
+    }
+
+    /// A datagram whose origin is no request's T1 is no reply.
+    #[test]
+    fn a_reply_to_no_request_of_the_run_is_no_reply() {
+        let t1 = ts(3_000_000_000.0);
+        let mut r = [0u8; 48];
+        r[24..32].copy_from_slice(&t1.to_be_bytes());
+        let t4 = ts(3_000_000_000.5);
+        assert!(sample(&r, t4, &[]).is_none());
+        assert!(sample(&r, t4, &[t1 + 1, t1 - 1]).is_none());
+        assert!(sample(&r, t4, &[t1]).is_some());
     }
 }
