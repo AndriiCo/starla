@@ -280,6 +280,13 @@ pub struct ResultUploader {
     metrics: starla_metrics::MetricsRegistry,
 }
 
+/// How long sending one post's request may take: httppost's default
+/// `--timeout`, which bounds its whole post (httppost.c:62, 1389-1398).
+/// Longer than [`UploaderConfig::timeout`], which bounds each wait for the
+/// stream to open or the answer to come, since a full post is up to
+/// `--maxpostsize` over the tunnel.
+pub(crate) const SEND_TIMEOUT: Duration = Duration::from_secs(300);
+
 impl ResultUploader {
     /// Create a new uploader with the given transport
     pub fn new(
@@ -612,9 +619,16 @@ impl ResultUploader {
         });
         let request = request_head(target, local_time, body.len());
 
-        stream.write_all(request.as_bytes()).await?;
-        stream.write_all(body).await?;
-        stream.flush().await?;
+        // Sending is bounded too: a channel whose window never reopens
+        // would otherwise hold the uploader, and the result handler with
+        // it, for as long as the SSH session lives.
+        tokio::time::timeout(SEND_TIMEOUT, async {
+            stream.write_all(request.as_bytes()).await?;
+            stream.write_all(body).await?;
+            stream.flush().await
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Sending the post timed out after {:?}", SEND_TIMEOUT))??;
 
         // Read HTTP response
         let mut response = Vec::with_capacity(256);
@@ -1105,6 +1119,44 @@ mod tests {
         for gone in ["\"7001\"", "\"9018\"", "\"9002\"", "9907", "9901"] {
             assert!(!body.contains(gone), "{gone} in {body}");
         }
+    }
+
+    /// A controller that accepts the stream and never reads from it: the
+    /// channel's window stays shut, as a stalled SSH channel's would.
+    struct StalledController;
+
+    impl UploadTransport for StalledController {
+        fn open(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Box<dyn UploadStream>>> + Send + '_>>
+        {
+            // A 16-byte pipe whose far end is kept, unread, for as long
+            // as the test runs.
+            let (probe, ctrl) = tokio::io::duplex(16);
+            std::mem::forget(ctrl);
+            Box::pin(async move { Ok(Box::new(probe) as Box<dyn UploadStream>) })
+        }
+    }
+
+    /// A post the controller never reads gives up after SEND_TIMEOUT
+    /// instead of holding the uploader for as long as the session lives.
+    #[tokio::test(start_paused = true)]
+    async fn a_post_the_controller_never_reads_times_out() {
+        let mut u = ResultUploader::new(
+            Box::new(StalledController),
+            UploaderConfig::default(),
+            starla_metrics::MetricsRegistry::new().unwrap(),
+            HostTelemetry::new(),
+            Arc::new(TimeSyncTracker::new()),
+        );
+        u.set_endpoint_path("/?PROBE_ID=1".into()).unwrap();
+        let started = tokio::time::Instant::now();
+        let err = u.upload_batch(&one_result(), Some("s")).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Sending the post timed out"),
+            "{err}"
+        );
+        assert_eq!(started.elapsed(), SEND_TIMEOUT);
     }
 
     /// do_dir's test of each file against --maxpostsize, header and footer
