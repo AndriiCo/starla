@@ -15,6 +15,7 @@ pub mod cert;
 pub mod hello;
 pub mod resolve;
 
+use crate::http::raw::quoted;
 use crate::traits::Measurement;
 use async_trait::async_trait;
 use cert::{Event, ReadState, Reader};
@@ -143,8 +144,9 @@ fn report_body(env: &Envelope, gstart: i64, dst: Option<IpAddr>, result: &str) -
     }
     let _ = write!(
         s,
-        "\"dst_name\":\"{}\", \"dst_port\":\"{}\", ",
-        env.dst_name, env.dst_port
+        "\"dst_name\":{}, \"dst_port\":\"{}\", ",
+        quoted(env.dst_name),
+        env.dst_port
     );
     if let Some(ttr) = env.ttr {
         let _ = write!(s, "\"ttr\":{ttr:.6}, ");
@@ -199,8 +201,9 @@ fn head_body(env: &Envelope, now: i64, h: &Head) -> String {
     }
     let _ = write!(
         s,
-        "\"time\":{now}, \"dst_name\":\"{}\", \"dst_port\":\"{}\"",
-        env.dst_name, env.dst_port
+        "\"time\":{now}, \"dst_name\":{}, \"dst_port\":\"{}\"",
+        quoted(env.dst_name),
+        env.dst_port
     );
     if let Some(ttr) = env.ttr {
         let _ = write!(s, ", \"ttr\":{ttr:.6}");
@@ -572,6 +575,36 @@ mod tests {
         assert!(head_body(&env, 7, &head).starts_with("\"time\":7, \"dst_name\""));
         assert_eq!(method_ver((3, 0)), ("SSL", "3.0".into()));
         assert_eq!(method_ver((0x48, 0x54)), ("(unknown)", "72.84".into()));
+    }
+
+    /// The controller's host name is escaped in both reports, so a quote
+    /// in it does not end the string.
+    #[test]
+    fn the_host_name_is_escaped() {
+        let env = Envelope {
+            dst_name: "a\",\"x\":\"\\",
+            ..env_15001(None)
+        };
+        let head = Head {
+            version: (3, 3),
+            dst: "193.0.6.139".parse().unwrap(),
+            src: "192.0.2.10".into(),
+            ttc: 1.0,
+            rt: 2.0,
+            cipher: 0,
+        };
+        for body in [
+            report_body(&env, 7, None, "\"dnserr\":\"failed\""),
+            head_body(&env, 7, &head),
+        ] {
+            assert!(
+                body.contains(r#""dst_name":"a\",\"x\":\"\\", "dst_port":"443""#),
+                "{body}"
+            );
+            let v: serde_json::Value = serde_json::from_str(&format!("{{{body}}}")).unwrap();
+            assert_eq!(v["dst_name"], env.dst_name);
+            assert!(v.get("x").is_none());
+        }
     }
 
     /// -B's "bundle" comes after "time" in report()'s line and after "lts"

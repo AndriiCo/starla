@@ -527,9 +527,14 @@ async fn resolve(
     }
 }
 
-/// udp_dns_cb()'s error (evtdig.c:3025): the server as given, and why.
+/// udp_dns_cb()'s error (evtdig.c:3025): the server as given, and why,
+/// escaped as the server's name is where it is the line's "dst_name";
+/// the reference prints it as it came.
 pub(crate) fn getaddrinfo_failed(server: &str, why: &str) -> String {
-    format!("\"evdns_getaddrinfo\": \"{server} {why}\"")
+    format!(
+        "\"evdns_getaddrinfo\": {}",
+        crate::http::raw::quoted(&format!("{server} {why}"))
+    )
 }
 
 /// What evdns would have answered where the system resolver failed with

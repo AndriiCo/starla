@@ -71,11 +71,14 @@ impl DstName {
     /// `"dst_name":"…"` and, for a name, `, "ttr":…` with %f's six
     /// decimals, as ping.c:253-269 and traceroute.c:381-397 write them: the
     /// reference prints "ttr" whenever getaddrinfo(AI_NUMERICHOST) does not
-    /// take the target as an address.
+    /// take the target as an address. The name is the controller's, and
+    /// is escaped as NTP's is ([`crate::http::raw::quoted`]); the
+    /// reference prints it as it came, with `%s`.
     pub fn fields(&self) -> String {
+        let name = crate::http::raw::quoted(&self.name);
         match self.ttr {
-            Some(ttr) => format!("\"dst_name\":\"{}\", \"ttr\":{:.6}", self.name, ttr),
-            None => format!("\"dst_name\":\"{}\"", self.name),
+            Some(ttr) => format!("\"dst_name\":{name}, \"ttr\":{ttr:.6}"),
+            None => format!("\"dst_name\":{name}"),
         }
     }
 }
@@ -1667,6 +1670,24 @@ mod tests {
             ttr: None,
         };
         assert_eq!(literal.fields(), r#""dst_name":"2001:db8:7769:6e00::20""#);
+    }
+
+    /// A name with a quote, a backslash or a control byte in it is escaped,
+    /// so the line stays JSON with the name as given.
+    #[test]
+    fn dst_name_is_escaped() {
+        let name = DstName {
+            name: "a\",\"x\":\"\\\n".into(),
+            ttr: Some(1.0),
+        };
+        let fields = name.fields();
+        assert_eq!(
+            fields,
+            r#""dst_name":"a\",\"x\":\"\\\u000a", "ttr":1.000000"#
+        );
+        let v: serde_json::Value = serde_json::from_str(&format!("{{{fields}}}")).unwrap();
+        assert_eq!(v["dst_name"], "a\",\"x\":\"\\\n");
+        assert!(v.get("x").is_none());
     }
 
     #[test]

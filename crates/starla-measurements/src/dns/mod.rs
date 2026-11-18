@@ -8,6 +8,7 @@
 
 pub mod resolver;
 
+use crate::http::raw::quoted;
 use crate::target::Resolver;
 use crate::traits::Measurement;
 use async_trait::async_trait;
@@ -448,14 +449,14 @@ pub(crate) fn format_line(msm_id: u64, cfg: &DnsConfig, entries: &[Entry], end: 
                 Some(("dst_name", server, resolver::numeric_host(addr), addr))
             }
             Dst::Name(server) => {
-                let _ = write!(s, "\"dst_name\" : \"{server}\" , ");
+                let _ = write!(s, "\"dst_name\" : {} , ", quoted(server));
                 None
             }
             Dst::None => None,
         };
         if let Some((key, server, ip, addr)) = sent {
             if ip != *server {
-                let _ = write!(s, "\"{key}\" : \"{server}\" , ");
+                let _ = write!(s, "\"{key}\" : {} , ", quoted(server));
             }
             let _ = write!(
                 s,
@@ -1283,6 +1284,49 @@ mod tests {
             let end = e.printed;
             let line = uploaded(&format_line(msm, &cfg, &[e], end), lts);
             assert_eq!(stored(&line), archived(want), "{msm}: {line}");
+        }
+    }
+
+    /// The server's name is the controller's: a quote or a control byte in
+    /// it is escaped wherever the line names it, as "dst_name", as "name"
+    /// and in the getaddrinfo error, so the line stays JSON.
+    #[test]
+    fn a_server_name_is_escaped() {
+        let evil = "ns\",\"x\":\"\\\n";
+        let failed = ended(
+            7,
+            0,
+            Dst::Name(evil.into()),
+            None,
+            None,
+            error(&resolver::getaddrinfo_failed(evil, "failed")),
+            None,
+        );
+        let sent = ended(
+            7,
+            0,
+            Dst::Udp {
+                server: evil.into(),
+                addr: "192.0.2.1:53".parse().unwrap(),
+            },
+            None,
+            None,
+            Outcome::Timeout,
+            None,
+        );
+        for (e, key) in [(failed, "dst_name"), (sent, "name")] {
+            let line = uploaded(&format_line(1, &DnsConfig::default(), &[e], 7), 0);
+            assert!(line.contains(r#""ns\",\"x\":\"\\\u000a""#), "{line}");
+            let v = stored(&line);
+            assert_eq!(v[key], evil, "{line}");
+            assert!(v.get("x").is_none(), "{line}");
+            if key == "dst_name" {
+                assert_eq!(
+                    v["error"]["evdns_getaddrinfo"],
+                    format!("{evil} failed"),
+                    "{line}"
+                );
+            }
         }
     }
 
