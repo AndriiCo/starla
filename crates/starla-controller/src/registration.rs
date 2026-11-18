@@ -47,7 +47,11 @@ pub enum RegStep {
     Register(&'static str),
 }
 
-fn clamp_wait(secs: i64) -> i64 {
+/// A wait or re-registration timer kept within the bounds atlasinit's
+/// process_wait() puts on REG_WAIT_UNTIL, REREG_TIMER and CON_WAIT_TIMER
+/// alike (atlasinit.c:431-445): a server's TIMEOUT 0 is not a retry at once,
+/// nor one of years a probe that never comes back.
+pub fn clamp_wait(secs: i64) -> i64 {
     secs.clamp(MIN_WAIT_SECS, MAX_WAIT_SECS)
 }
 

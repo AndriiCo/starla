@@ -1042,11 +1042,17 @@ async fn run_background(background: Background) -> Result<()> {
                                 break (remote_port, session_id);
                             }
                             Ok(InitResponse::Wait { timeout_secs }) => {
-                                debug!(
-                                    "Controller requested wait, retrying in {} seconds",
-                                    timeout_secs
+                                // CON_WAIT_TIMER, clamped as atlasinit's
+                                // process_wait() clamps it: a TIMEOUT 0
+                                // would otherwise re-run INIT in a loop.
+                                let wait_secs = starla_controller::registration::clamp_wait(
+                                    i64::from(timeout_secs),
                                 );
-                                con_keep.set_wait(unix_now() + i64::from(timeout_secs));
+                                debug!(
+                                    "Controller requested wait of {} s, retrying in {} seconds",
+                                    timeout_secs, wait_secs
+                                );
+                                con_keep.set_wait(unix_now() + wait_secs);
                                 save_con_keep(&con_keep, &con_keep_path);
                                 tokio::select! {
                                     _ = tokio::signal::ctrl_c() => {
@@ -1055,7 +1061,7 @@ async fn run_background(background: Background) -> Result<()> {
                                         result_cancel_token.cancel();
                                         return Ok(());
                                     }
-                                    _ = tokio::time::sleep(Duration::from_secs(timeout_secs as u64)) => {
+                                    _ = tokio::time::sleep(Duration::from_secs(wait_secs.unsigned_abs())) => {
                                         // Check if connection is still alive before retrying
                                         if !ctrl_ssh.is_connected().await {
                                             warn!("Controller connection lost during wait; reconnecting");
