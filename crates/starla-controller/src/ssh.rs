@@ -117,6 +117,10 @@ pub struct ControllerInfo {
     /// `REREGISTER <secs>`: how long the assignment holds before the probe
     /// must ask the registration server again.
     pub rereg_secs: Option<u64>,
+    /// The controller's host key from the `CONTROLLER` line, which the
+    /// reference writes to known_hosts_controllers for its strict
+    /// host-key check. `None` if the line carried none Starla can parse.
+    pub host_key: Option<PublicKey>,
 }
 
 /// INIT response variants
@@ -277,6 +281,24 @@ fn read_os_release() -> (Option<String>, Option<String>) {
     (id, version_id)
 }
 
+/// The host key on a registration reply's `CONTROLLER <host> <port> <type>
+/// <base64>` line, from the fields after the port; `None`, with a warning,
+/// if there is none Starla can parse, and the controller's key is then
+/// trusted on first use as before.
+fn controller_host_key(fields: &[&str]) -> Option<PublicKey> {
+    let parsed = match fields {
+        [key_type, blob, ..] => PublicKey::from_openssh(&format!("{key_type} {blob}")).ok(),
+        _ => None,
+    };
+    if parsed.is_none() {
+        warn!(
+            "The registration server's CONTROLLER line has no host key Starla can read; \
+             the controller's key will be trusted on first use"
+        );
+    }
+    parsed
+}
+
 /// Known SSH host keys for server verification (TOFU model)
 ///
 /// On first connection to a server, the key is saved to a known_hosts file.
@@ -418,6 +440,34 @@ impl KnownHosts {
 
             Ok(true)
         }
+    }
+
+    /// Pin `key` for `host:port`, replacing any key saved for it: what the
+    /// registration server says the controller's key is. The reference
+    /// rewrites known_hosts_controllers from each registration reply and
+    /// connects with StrictHostKeyChecking, so a controller whose key RIPE
+    /// has rotated is reached after the next registration, and a first
+    /// connection is checked rather than trusted.
+    pub async fn pin(&self, host: &str, port: u16, key: &PublicKey) -> std::io::Result<()> {
+        let host_port = format!("{}:{}", host, port);
+        let pinned = format!("{} {}", key.algorithm().as_str(), key.public_key_base64());
+        let mut hosts = self.hosts.lock().await;
+        match hosts.get(&host_port) {
+            Some(saved) if *saved == pinned => return Ok(()),
+            Some(saved) => info!(
+                "The registration server gives {} a new host key ({}); replacing {}",
+                host_port, pinned, saved
+            ),
+            None => debug!(
+                "Pinning {}'s host key from the registration server",
+                host_port
+            ),
+        }
+        hosts.insert(host_port, pinned);
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        write_private_file(&self.path, self.render(&hosts).as_bytes())
     }
 }
 
@@ -911,6 +961,7 @@ pub fn parse_init_response(output: &str) -> anyhow::Result<InitResponse> {
                 let mut controller_port: Option<u16> = None;
                 let mut probe_id: u32 = 0;
                 let mut rereg_secs: Option<u64> = None;
+                let mut host_key: Option<PublicKey> = None;
 
                 for line in lines.iter().skip(1) {
                     let parts: Vec<&str> = line.split_whitespace().collect();
@@ -921,6 +972,7 @@ pub fn parse_init_response(output: &str) -> anyhow::Result<InitResponse> {
                     if parts[0] == "CONTROLLER" && parts.len() >= 4 {
                         controller_host = Some(parts[1].to_string());
                         controller_port = parts[2].parse().ok();
+                        host_key = controller_host_key(&parts[3..]);
                     }
 
                     if parts[0] == "REREGISTER" && parts.len() >= 2 {
@@ -942,6 +994,7 @@ pub fn parse_init_response(output: &str) -> anyhow::Result<InitResponse> {
                         port,
                         probe_id,
                         rereg_secs,
+                        host_key,
                     }));
                 }
 
@@ -2643,5 +2696,100 @@ mod tests {
         assert!(first.iter().all(|&n| (800..1200).contains(&n)), "{first:?}");
         let v4 = first[1] + first[4];
         assert!((1700..2300).contains(&v4), "{v4}");
+    }
+
+    #[test]
+    fn a_registration_reply_carries_the_controllers_host_key() {
+        let key = generate_key().unwrap();
+        let openssh = key.public_key().to_openssh().unwrap();
+        let reply = format!(
+            "OK\nPROBE_ID 1018212\nCONTROLLER ctr-sea-test.atlas.prod.ripe.net 443 {openssh}\nREREGISTER 86400\n"
+        );
+        match parse_init_response(&reply).unwrap() {
+            InitResponse::Controller(c) => {
+                assert_eq!(c.host_key.as_ref(), Some(key.public_key()));
+                assert_eq!(c.port, 443);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A key that does not parse leaves the controller to TOFU, as before
+        let reply = "OK\nCONTROLLER ctr-sea-test.atlas.prod.ripe.net 443 ssh-ed25519 AAAA\n";
+        match parse_init_response(reply).unwrap() {
+            InitResponse::Controller(c) => assert_eq!(c.host_key, None),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_registration_servers_key_replaces_a_trusted_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let first = generate_key().unwrap();
+        let rotated = generate_key().unwrap();
+        let known = KnownHosts::load(&path).unwrap();
+        assert!(known.verify("ctr", 443, first.public_key()).await.unwrap());
+
+        known.pin("ctr", 443, rotated.public_key()).await.unwrap();
+        assert!(known
+            .verify("ctr", 443, rotated.public_key())
+            .await
+            .unwrap());
+        assert!(!known.verify("ctr", 443, first.public_key()).await.unwrap());
+
+        // On disk too, owner-only, for the next start
+        let reloaded = KnownHosts::load(&path).unwrap();
+        assert!(reloaded
+            .verify("ctr", 443, rotated.public_key())
+            .await
+            .unwrap());
+        assert!(!reloaded
+            .verify("ctr", 443, first.public_key())
+            .await
+            .unwrap());
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn a_pinned_controller_with_another_key_is_refused() {
+        // The registration server named one key; a server presenting
+        // another is not trusted on first use
+        let (probe, controller) = tokio::io::duplex(1 << 16);
+        let server = russh::server::Config {
+            keys: vec![generate_key().unwrap()],
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        tokio::spawn(async move {
+            if let Ok(running) = russh::server::run_stream(
+                Arc::new(server),
+                controller,
+                Controller {
+                    channels: Vec::new(),
+                },
+            )
+            .await
+            {
+                let _ = running.await;
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let known = KnownHosts::load(&dir.path().join("known_hosts")).unwrap();
+        known
+            .pin("ctr-test", 443, generate_key().unwrap().public_key())
+            .await
+            .unwrap();
+        let conn = SshConnection::connect_stream(
+            probe,
+            "ctr-test",
+            443,
+            &generate_key().unwrap(),
+            quick_config(),
+            known,
+        )
+        .await;
+        assert!(conn.is_err());
     }
 }

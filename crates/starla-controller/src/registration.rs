@@ -154,6 +154,8 @@ impl RegState {
                 port,
                 probe_id,
                 rereg_secs: None,
+                // Pinned in known_hosts when the reply came, not kept here
+                host_key: None,
             });
         }
         st
@@ -290,6 +292,7 @@ mod tests {
             port: 443,
             probe_id: 1018212,
             rereg_secs,
+            host_key: None,
         }
     }
 

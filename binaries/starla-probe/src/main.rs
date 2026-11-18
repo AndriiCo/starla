@@ -975,6 +975,15 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
                         s.last_connection_error = None;
                     }
 
+                    // The controller is checked against the key the
+                    // (pinned) registration server gave, not trusted on
+                    // first use. In memory even if the save fails.
+                    if let Some(key) = &info.host_key {
+                        if let Err(e) = known_hosts.pin(&info.host, info.port, key).await {
+                            warn!("Failed to save the controller's host key: {}", e);
+                        }
+                    }
+
                     reg.registered(&info, unix_now());
                     save_reg(&reg, &reg_path);
                     reg_delay = Duration::from_secs(5);
@@ -2398,6 +2407,7 @@ mod tests {
             port: 443,
             probe_id: 1018212,
             rereg_secs: Some(86_400),
+            host_key: None,
         };
         reg.registered(&ctr, unix_now());
         save_reg(&reg, &path);
