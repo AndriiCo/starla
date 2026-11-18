@@ -478,6 +478,17 @@ impl KnownHosts {
 /// telnet command parser.
 type Forwards = Arc<std::sync::Mutex<std::collections::HashSet<u32>>>;
 
+/// The most telnet connections the controller's forward may have open at
+/// once; a channel past them is refused (resource shortage) before the
+/// telnet session starts. busybox's telnetd sets no bound. RIPE's
+/// controller opens one connection per request and closes it once
+/// answered, two at once at most in the bursts of one-offs seen on enodia
+/// (2026-10-14 and -16); an older one a newer one takes over is left for it
+/// to close (telnet.rs, `supersede`). This leaves room for those while
+/// bounding what anyone who can reach the controller's end of the forward
+/// can hold open before logging in.
+const MAX_TELNET_CHANNELS: usize = 16;
+
 /// Client handler for russh
 struct AtlasClientHandler {
     /// Known hosts for server key verification
@@ -495,6 +506,8 @@ struct AtlasClientHandler {
     session_id: Arc<tokio::sync::RwLock<Option<String>>>,
     /// The ports a forwarded channel may be for
     forwards: Forwards,
+    /// A permit for each telnet connection open, [`MAX_TELNET_CHANNELS`]
+    telnet_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl AtlasClientHandler {
@@ -516,6 +529,7 @@ impl AtlasClientHandler {
             probe_id,
             session_id,
             forwards: Forwards::default(),
+            telnet_slots: Arc::new(tokio::sync::Semaphore::new(MAX_TELNET_CHANNELS)),
         }
     }
 }
@@ -573,6 +587,18 @@ impl client::Handler for AtlasClientHandler {
             return Ok(());
         }
 
+        // Held for as long as the telnet session runs
+        let Ok(slot) = self.telnet_slots.clone().try_acquire_owned() else {
+            warn!(
+                "Refusing a forwarded channel from {}:{}: {} telnet connections are open already",
+                originator_address, originator_port, MAX_TELNET_CHANNELS
+            );
+            reply
+                .reject(russh::ChannelOpenFailure::ResourceShortage)
+                .await;
+            return Ok(());
+        };
+
         // Since russh 0.62 the handler confirms the channel itself, and a
         // dropped `reply` rejects it. Confirm before the telnet session can
         // write on it, as russh 0.61 did on the handler's return.
@@ -592,6 +618,7 @@ impl client::Handler for AtlasClientHandler {
                 error!("Error handling forwarded telnet connection: {}", e);
             }
             debug!("Forwarded telnet connection ended");
+            drop(slot);
         });
 
         Ok(())
@@ -2892,5 +2919,58 @@ mod tests {
         assert!(open(2223).await.is_err(), "another port");
         assert!(open(22).await.is_err(), "another port");
         assert!(open(2222).await.is_ok(), "the forwarded port");
+    }
+
+    #[tokio::test]
+    async fn telnet_channels_past_the_cap_are_refused_until_one_closes() {
+        let (probe, controller) = tokio::io::duplex(1 << 16);
+        let server = russh::server::Config {
+            keys: vec![generate_key().unwrap()],
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        let running = russh::server::run_stream(Arc::new(server), controller, Forwarder);
+        let dir = tempfile::tempdir().unwrap();
+        let known = KnownHosts::load(&dir.path().join("known_hosts")).unwrap();
+        let key = generate_key().unwrap();
+        let connect =
+            SshConnection::connect_stream(probe, "ctr-test", 443, &key, quick_config(), known);
+        let (running, conn) = tokio::join!(running, connect);
+        let running = running.unwrap();
+        let conn = conn.unwrap();
+        let handle = running.handle();
+        tokio::spawn(running);
+        conn.request_reverse_tunnel(2222).await.unwrap();
+
+        let open = || {
+            let handle = handle.clone();
+            async move {
+                handle
+                    .channel_open_forwarded_tcpip("localhost", 2222, "127.0.0.1", 40000)
+                    .await
+            }
+        };
+        // Connections that never log in, each holding its slot
+        let mut channels = Vec::new();
+        for i in 0..MAX_TELNET_CHANNELS {
+            channels.push(open().await.unwrap_or_else(|e| panic!("channel {i}: {e}")));
+        }
+        assert!(open().await.is_err(), "one past the cap");
+
+        // The controller closes one: its telnet session ends, and its slot
+        // is free again
+        channels.pop().unwrap().close().await.unwrap();
+        let reopened = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(channel) = open().await {
+                    break channel;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(reopened.is_ok(), "a slot is free once a connection is gone");
+        assert!(open().await.is_err(), "and the cap holds again");
     }
 }

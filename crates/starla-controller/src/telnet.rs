@@ -476,6 +476,38 @@ const BAD_REMOUNT: &str = "BAD_REMOUNT\r\n\r\n";
 /// line.
 const CRONTAB_MAX_LINES: usize = 65534;
 
+/// The most text a crontab may hold, counted as add_to_crontab writes its
+/// lines (what follows "CRONLINE "). telnetd writes each line to root.new on
+/// disk and sets no bound; Starla holds the crontab in memory, with each line
+/// parsed, until it has ended. RIPE's crontabs are some 800 lines of under
+/// 200 bytes, about 150 KB. A crontab past this is never installed and its
+/// session is closed, as when a session goes mid-crontab (kill_session,
+/// telnetd.c:1302-1311).
+const CRONTAB_MAX_BYTES: usize = 4 << 20;
+
+/// The longest line a session takes before it has logged in: the login name
+/// (C_TO_P_TEST_V1) and the password (the SESSION_ID, 64 hex digits). A
+/// longer one closes the connection.
+const MAX_LOGIN_LINE_LEN: usize = 256;
+
+/// The longest line a logged-in session takes; a longer one closes the
+/// connection. telnetd keeps a session's input in one buffer of BUFSIZE,
+/// (8 KiB - sizeof(struct tsession)) / 2, about 4 KiB (telnetd.c:203-210),
+/// and getline_2pty finds a line only within it (:1402-1448): a longer line
+/// fills the buffer and the session reads nothing more. Twice that leaves
+/// room for Starla's own JSON lines.
+const MAX_LINE_LEN: usize = 8 * 1024;
+
+/// How long a connection has to log in. telnetd waits for as long as it
+/// takes; RIPE's controller sends its login name and password as soon as the
+/// banner comes. A connection that has not logged in by then is closed.
+const LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The bad passwords a connection may send. telnetd answers each with
+/// BAD_PASSWORD and takes another (telnetd.c:1129-1136), with no end;
+/// Starla closes the connection after this many.
+const MAX_BAD_PASSWORDS: u32 = 3;
+
 // Where request paths may point: rebased_validated_filename(ATLAS_SPOOLDIR,
 // path, "crons") (libbb/validate_filename.c) takes a path under
 // /home/atlas/crons/ (what RIPE's controller sends) and rebases it onto the
@@ -692,10 +724,10 @@ pub async fn handle_connection(
     // The crontab DO_CRONTAB is taking, root.new: dropped unsent if the
     // session ends before a line ends the crontab
     let mut crontab: Option<CrontabSpec> = None;
-
-    // Maximum length of a line not yet ended, to bound the memory a
-    // malicious or malfunctioning controller can take
-    const MAX_LINE_LEN: usize = 256 * 1024; // 256KB
+    // The bytes of its lines, against CRONTAB_MAX_BYTES
+    let mut crontab_bytes = 0usize;
+    let login_deadline = tokio::time::Instant::now() + LOGIN_TIMEOUT;
+    let mut bad_passwords = 0u32;
 
     // A crontab is ~800 lines, each parsed and logged here with no await
     // between them while the reads find data waiting: yield every so many,
@@ -712,6 +744,13 @@ pub async fn handle_connection(
                 if supersede(&mut state, &mut atlas) {
                     continue;
                 }
+                break;
+            }
+            () = tokio::time::sleep_until(login_deadline), if logging_in(state) => {
+                warn!(
+                    "Telnet: no login in {:?}, closing the connection",
+                    LOGIN_TIMEOUT
+                );
                 break;
             }
         };
@@ -736,6 +775,14 @@ pub async fn handle_connection(
                 && !supersede(&mut state, &mut atlas)
             {
                 break 'session;
+            }
+            if line.len() > max_line_len(state) {
+                anyhow::bail!(
+                    "a line of {} bytes, over the {} a session in state {:?} takes",
+                    line.len(),
+                    max_line_len(state),
+                    state
+                );
             }
             log_received(state, &line);
 
@@ -765,9 +812,18 @@ pub async fn handle_connection(
                     } else {
                         // BAD_PASSWORD, and the state stays GET_PASSWORD
                         // (telnetd.c:1129-1136): the connection stays open
-                        // and the next line is another try.
+                        // and the next line is another try, up to
+                        // MAX_BAD_PASSWORDS.
                         warn!("Bad password received");
                         reply(&mut writer, BAD_PASSWORD).await;
+                        bad_passwords += 1;
+                        if bad_passwords >= MAX_BAD_PASSWORDS {
+                            warn!(
+                                "Telnet: {} bad passwords, closing the connection",
+                                bad_passwords
+                            );
+                            break 'session;
+                        }
                     }
                 }
                 ConnectionState::DoCrontab if line.starts_with(CMD_CRONLINE) => {
@@ -776,8 +832,17 @@ pub async fn handle_connection(
                     // the crontab has ended
                     match &mut crontab {
                         Some(crontab) if crontab.lines.len() < CRONTAB_MAX_LINES => {
+                            let text = &line[CMD_CRONLINE.len()..];
+                            crontab_bytes += text.len();
+                            if crontab_bytes > CRONTAB_MAX_BYTES {
+                                anyhow::bail!(
+                                    "crontab {} holds more than {} bytes; not installed",
+                                    crontab.dir,
+                                    CRONTAB_MAX_BYTES
+                                );
+                            }
                             crontab.lines.push(CrontabLine {
-                                line: line[CMD_CRONLINE.len()..].to_string(),
+                                line: text.to_string(),
                                 command: parse_command(&line),
                             });
                         }
@@ -804,7 +869,10 @@ pub async fn handle_connection(
                     }
                     match command {
                         // start_crontab opened root.new: its CRONLINEs follow
-                        Some(TelnetCommand::Crontab(started)) => crontab = Some(started),
+                        Some(TelnetCommand::Crontab(started)) => {
+                            crontab = Some(started);
+                            crontab_bytes = 0;
+                        }
                         Some(command) => {
                             if !forward(&command_tx, command).await {
                                 break 'session;
@@ -823,16 +891,34 @@ pub async fn handle_connection(
             }
         }
 
-        if lines.pending() > MAX_LINE_LEN {
-            error!(
-                "Telnet line exceeded {}KB, disconnecting",
-                MAX_LINE_LEN / 1024
+        if lines.pending() > max_line_len(state) {
+            anyhow::bail!(
+                "a line not yet ended of {} bytes, over the {} a session in state {:?} takes",
+                lines.pending(),
+                max_line_len(state),
+                state
             );
-            anyhow::bail!("Line buffer overflow");
         }
     }
 
     Ok(())
+}
+
+/// Whether a session in `state` has yet to log in
+fn logging_in(state: ConnectionState) -> bool {
+    matches!(
+        state,
+        ConnectionState::GetLoginName | ConnectionState::GetPassword
+    )
+}
+
+/// The longest line a session in `state` takes
+fn max_line_len(state: ConnectionState) -> usize {
+    if logging_in(state) {
+        MAX_LOGIN_LINE_LEN
+    } else {
+        MAX_LINE_LEN
+    }
 }
 
 /// One controller session at a time, as telnetd's `atlas_ts`

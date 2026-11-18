@@ -763,3 +763,131 @@ async fn request_lines_are_logged_as_the_twin_reads_them() {
         .iter()
         .all(|m| !m.contains(SID) && !m.contains("wrong")));
 }
+
+/// What the probe writes after its banner when the controller sends `input`
+/// and keeps its side open, so that only the probe can end the connection;
+/// the handler's result, and the commands it handed on.
+async fn closed_by_probe(input: &[u8]) -> (String, anyhow::Result<()>, Vec<TelnetCommand>) {
+    let probe = Arc::new(tokio::sync::RwLock::new(Some(SID.to_string())));
+    let Open { controller, mut commands, handler } = open(&probe);
+    let (mut from_probe, mut to_probe) = tokio::io::split(controller);
+    let write = async {
+        // The probe may close before it has read all of it
+        let _ = to_probe.write_all(input).await;
+        to_probe
+    };
+    let read = async {
+        let mut out = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            from_probe.read_to_end(&mut out),
+        )
+        .await
+        .expect("the probe closes the connection")
+        .unwrap();
+        out
+    };
+    let (to_probe, out) = tokio::join!(write, read);
+    let result = handler.await.unwrap();
+    drop(to_probe);
+    let banner = banner();
+    assert!(out.starts_with(&banner), "banner: {:?}", String::from_utf8_lossy(&out));
+    let mut handed = Vec::new();
+    while let Ok(command) = commands.try_recv() {
+        handed.push(command);
+    }
+    (String::from_utf8_lossy(&out[banner.len()..]).into_owned(), result, handed)
+}
+
+#[tokio::test]
+async fn a_line_past_its_state_s_limit_closes_the_connection() {
+    // Before the login: a name or a password over MAX_LOGIN_LINE_LEN, ended
+    // or not, closes the connection; the name is not echoed
+    let long = "x".repeat(MAX_LOGIN_LINE_LEN + 1);
+    for input in [long.clone(), format!("{long}\n"), format!("C_TO_P_TEST_V1\n{long}")] {
+        let (out, result, commands) = closed_by_probe(input.as_bytes()).await;
+        assert!(result.is_err(), "{input:?}");
+        assert!(out.is_empty() || out == "\r\nPassword: ", "{out:?}");
+        assert!(commands.is_empty());
+    }
+
+    // After it: a line of MAX_LINE_LEN is taken (here one of Starla's JSON
+    // lines), one byte more closes the connection, ended or not, and what
+    // follows is not read
+    let json = |len: usize| {
+        let head = r#"{"type":"ping","msm_id":1001,"target":"192.0.2.1","pad":""#;
+        format!("{head}{}\"}}", "p".repeat(len - head.len() - 2))
+    };
+    assert_eq!(json(MAX_LINE_LEN).len(), MAX_LINE_LEN);
+    let oneoff = "ONEOFF /home/atlas/crons/oneoff evping -A \"1\" 192.0.2.1";
+    let request = format!("{}{}\n\n", login(), json(MAX_LINE_LEN));
+    let (out, commands) = session(&request).await;
+    assert_eq!(out, "\r\nPassword: BAD_COMMAND\r\n\r\nOK\r\n\r\n");
+    assert_eq!(handed_on(&commands), parsed(&[json(MAX_LINE_LEN)]));
+    for input in [
+        format!("{}{}\n{oneoff}\n\n", login(), json(MAX_LINE_LEN + 1)),
+        format!("{}{}", login(), "p".repeat(MAX_LINE_LEN + 1)),
+    ] {
+        let (out, result, commands) = closed_by_probe(input.as_bytes()).await;
+        assert!(result.is_err());
+        assert_eq!(out, "\r\nPassword: ");
+        assert!(commands.is_empty(), "{commands:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_crontab_past_its_byte_limit_is_never_installed() {
+    // Lines of about 8 KB, as many as take the crontab past
+    // CRONTAB_MAX_BYTES: the session closes at the line that does, and the
+    // crontab, never ended, is not handed on (as kill_session leaves
+    // root.new, telnetd.c:1302-1311)
+    let target = "a".repeat(MAX_LINE_LEN - 100);
+    let line = |i: usize| format!("CRONLINE 60 {i} 2000000000 NONE 0 evping -A \"{i}\" {target}");
+    let mut request = format!("{}CRONTAB /home/atlas/crons/7\n", login());
+    for i in 0..CRONTAB_MAX_BYTES / line(0).len() + 2 {
+        request += &line(i);
+        request.push('\n');
+    }
+    request.push('\n');
+    let (out, result, commands) = closed_by_probe(request.as_bytes()).await;
+    assert!(result.is_err());
+    assert_eq!(out, "\r\nPassword: ");
+    assert!(commands.is_empty(), "{} commands", commands.len());
+}
+
+#[tokio::test]
+async fn the_third_bad_password_closes_the_connection() {
+    // telnetd takes another password after each BAD_PASSWORD for as long as
+    // the connection lasts (telnetd.c:1129-1136); Starla takes three
+    let request = format!(
+        "C_TO_P_TEST_V1\nwrong\nwrong\nwrong\n{SID}\nONEOFF /home/atlas/crons/oneoff evping -A \"1\" 192.0.2.1\n\n"
+    );
+    let (out, result, commands) = closed_by_probe(request.as_bytes()).await;
+    result.unwrap();
+    assert_eq!(out, format!("\r\nPassword: {}", BAD_PASSWORD.repeat(3)));
+    assert!(commands.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_connection_that_does_not_log_in_is_closed() {
+    // telnetd waits for a login for as long as the connection lasts; Starla
+    // for LOGIN_TIMEOUT, whether it has the name or nothing yet
+    let probe = Arc::new(tokio::sync::RwLock::new(Some(SID.to_string())));
+    for input in ["", "C_TO_P_TEST_V1\n"] {
+        let mut session = open(&probe);
+        let start = tokio::time::Instant::now();
+        session.controller.write_all(input.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        session.controller.read_to_end(&mut out).await.unwrap();
+        assert_eq!(start.elapsed(), LOGIN_TIMEOUT, "{input:?}");
+        session.handler.await.unwrap().unwrap();
+    }
+
+    // Logged in, it stays open past that, for its controller to close
+    let mut session = open(&probe);
+    authenticate(&mut session).await;
+    tokio::time::sleep(LOGIN_TIMEOUT * 4).await;
+    let out = close_with(&mut session, "\n").await;
+    assert!(out.ends_with("\r\nPassword: OK\r\n\r\n"), "{out:?}");
+    session.handler.await.unwrap().unwrap();
+}
