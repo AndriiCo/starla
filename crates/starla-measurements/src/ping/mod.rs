@@ -290,6 +290,14 @@ pub fn strerror(e: &std::io::Error) -> String {
 /// from probes on firmware 5130 include 28 with fewer than three entries
 /// and no error, and none with a timeout after a reply; Starla wrote
 /// `{ "x":"*" }` for every lost request.
+///
+/// A run keeps at most [`REPLIES_PER_REQUEST`] replies for each request it
+/// has sent so far; a reply past that still moves the sequence number as
+/// ping.c's would, but writes no entry. ping.c keeps every one: the target
+/// knows the run's cookie and can send its echo reply again as fast as it
+/// likes, each a `{ "dup":1, "rtt":… }` (or, on IPv4 with the sequence
+/// number it awaits, a reply), and the line grew without bound until the
+/// uploader dropped it at 500 KB, and the result with it.
 #[derive(Debug)]
 pub(crate) struct Session {
     v6: bool,
@@ -297,7 +305,18 @@ pub(crate) struct Session {
     got_reply: bool,
     send_error: bool,
     events: Vec<PingEvent>,
+    /// Requests sent (or tried), replies kept, and replies past the
+    /// budget
+    sent: usize,
+    replies: usize,
+    dropped: usize,
 }
+
+/// The replies a run keeps per request it sent: its answer and three
+/// duplicates. Of RIPE's results, a request answered more than twice is
+/// rare (a broadcast or a looping path), and four entries for each of up
+/// to 16 packets is well under a line's 500 KB.
+pub(crate) const REPLIES_PER_REQUEST: usize = 4;
 
 impl Session {
     pub(crate) fn new(v6: bool) -> Self {
@@ -307,6 +326,9 @@ impl Session {
             got_reply: false,
             send_error: false,
             events: Vec::new(),
+            sent: 0,
+            replies: 0,
+            dropped: 0,
         }
     }
 
@@ -318,6 +340,7 @@ impl Session {
     /// ping_xmit sent a request, or tried to.
     pub(crate) fn sent(&mut self, local: Option<IpAddr>, error: Option<String>) {
         self.send_error |= error.is_some();
+        self.sent += 1;
         self.events.push(PingEvent::Sent { local, error });
     }
 
@@ -331,13 +354,18 @@ impl Session {
         dst: Option<IpAddr>,
     ) {
         let dup = seq != u16::from(self.seq);
-        self.events.push(PingEvent::Reply {
-            dup,
-            rtt,
-            ttl,
-            size,
-            dst,
-        });
+        if self.replies < self.sent.saturating_mul(REPLIES_PER_REQUEST) {
+            self.replies += 1;
+            self.events.push(PingEvent::Reply {
+                dup,
+                rtt,
+                ttl,
+                size,
+                dst,
+            });
+        } else {
+            self.dropped += 1;
+        }
         self.got_reply |= !dup;
         if self.v6 || !dup {
             self.seq = self.seq.wrapping_add(1);
@@ -353,6 +381,13 @@ impl Session {
     }
 
     pub(crate) fn into_events(self) -> Vec<PingEvent> {
+        if self.dropped > 0 {
+            tracing::debug!(
+                "ping: {} replies past {} per request not written",
+                self.dropped,
+                REPLIES_PER_REQUEST
+            );
+        }
         self.events
     }
 }
@@ -1390,6 +1425,48 @@ mod tests {
         assert_eq!(unknown(&p).ttl, Some(0));
         p.outcome_result(&run(true, ip("2001:db8::31"), &[Some((1.0, 59))]));
         assert_eq!(unknown(&p).ttl, Some(59));
+    }
+
+    /// A target that sends its echo reply again and again: each request
+    /// keeps its answer and three duplicates, the rest are not written but
+    /// still move the sequence number as ping.c's do.
+    #[test]
+    fn a_flood_of_replies_is_capped_per_request() {
+        for v6 in [false, true] {
+            let mut session = Session::new(v6);
+            let mut seqs = Vec::new();
+            for _ in 0..3 {
+                let seq = u16::from(session.seq());
+                seqs.push(seq);
+                session.sent(None, None);
+                for _ in 0..10_000 {
+                    session.reply(seq, 1.0, Some(57), 32, None);
+                }
+                session.interval_over();
+            }
+            // the sequence numbers moved as without the cap: IPv4 on the
+            // answer alone, IPv6 on every reply
+            let expected: Vec<u16> = if v6 {
+                vec![1, 1 + 10_000 % 256, 1 + 20_000 % 256]
+            } else {
+                vec![1, 2, 3]
+            };
+            assert_eq!(seqs, expected, "v6 {v6}");
+            let events = session.into_events();
+            let replies = |dup: bool| {
+                events
+                    .iter()
+                    .filter(|e| matches!(e, PingEvent::Reply { dup: d, .. } if *d == dup))
+                    .count()
+            };
+            assert_eq!(replies(false) + replies(true), 3 * REPLIES_PER_REQUEST);
+            assert_eq!(replies(false), 3, "v6 {v6}");
+            let request = r#"{ "rtt":1.000000 }, { "dup":1, "rtt":1.000000 }, { "dup":1, "rtt":1.000000 }, { "dup":1, "rtt":1.000000 }"#;
+            assert_eq!(
+                ping_cb(&events, 32, None, 0).result,
+                format!("[ {request}, {request}, {request} ]")
+            );
+        }
     }
 
     /// The TTL kept after a timeout, and with only duplicates (ping.c:355-

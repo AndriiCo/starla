@@ -190,6 +190,15 @@ pub fn entry(a: &Answer, late: Option<i32>, dup: bool, rtt: f64, tos: u32) -> St
     e
 }
 
+/// The duplicate and late replies a hop keeps, besides each probe's answer
+/// or timeout. The reference writes every one (ready_callback4/6,
+/// traceroute.c:1897-2030, 3726-3900), so a hop that sends its reply again
+/// and again during the `-z` wait, or replies that keep coming late, grew
+/// the line without bound, until the uploader dropped it at 500 KB, and the
+/// result with it. Past these a reply still counts for the trace (an
+/// answer from the destination still ends it) but has no entry.
+pub const EXTRA_PER_HOP: usize = 16;
+
 /// The probe to send next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Probe {
@@ -225,6 +234,10 @@ pub struct Trace {
     finished: bool,
     /// When the probe in flight went (gettime_mono)
     xmit: Duration,
+    /// Duplicate and late entries in the current hop, and those past
+    /// [`EXTRA_PER_HOP`] in the whole trace
+    extra: usize,
+    dropped: usize,
 }
 
 impl Trace {
@@ -252,6 +265,8 @@ impl Trace {
             gotresp: false,
             finished: false,
             xmit: Duration::ZERO,
+            extra: 0,
+            dropped: 0,
         }
     }
 
@@ -260,6 +275,13 @@ impl Trace {
     }
 
     pub fn into_hops(self) -> Vec<Hop> {
+        if self.dropped > 0 {
+            tracing::debug!(
+                "traceroute: {} duplicate or late replies past {} per hop not written",
+                self.dropped,
+                EXTRA_PER_HOP
+            );
+        }
         self.hops
     }
 
@@ -299,6 +321,7 @@ impl Trace {
                 self.hop = 255;
             }
             self.hops.push(Hop::new(self.hop));
+            self.extra = 0;
         }
         self.seq = self.seq.wrapping_add(1);
         // An IPv4 Paris UDP probe carries its sequence number in the
@@ -375,11 +398,15 @@ impl Trace {
             (Branch::V6Err, Some(_), None) => -42.0,
             _ => since(self.xmit),
         };
-        let e = entry(a, late, dup, rtt, self.tos);
-        self.entries().push(e);
-
         // What the reply says about the trace.
         let fresh = late.is_none() && !dup;
+        if fresh || self.extra < EXTRA_PER_HOP {
+            self.extra += usize::from(!fresh);
+            let e = entry(a, late, dup, rtt, self.tos);
+            self.entries().push(e);
+        } else {
+            self.dropped += 1;
+        }
         match (a.branch, a.outcome) {
             // ready_callback4's TCP/UDP branch counts duplicates too.
             (Branch::V4ErrL4, Outcome::TimeExceeded) => {
@@ -629,6 +656,60 @@ mod tests {
         // An answer from the future is no answer.
         assert_eq!(t.reply(&port_unreachable(9), ms(4004.0)), None);
         assert_eq!(t.hops()[0].entries.len(), 4);
+    }
+
+    /// A router that sends its answer again and again, and late: each hop
+    /// keeps every probe's answer and 16 duplicate or late replies besides,
+    /// and the next hop starts afresh.
+    #[test]
+    fn a_flood_of_duplicate_and_late_replies_is_capped_per_hop() {
+        let opts = TracerouteOptions {
+            max_hops: 2,
+            count: 2,
+            ..udp6()
+        };
+        let mut t = Trace::new(true, &opts, Some(1));
+        let router = |seq: u16| {
+            let mut a = port_unreachable(u32::from(seq));
+            a.outcome = Outcome::TimeExceeded;
+            a.inner_ttl = 1;
+            a.sent_tv = Some(ms(0.0));
+            a
+        };
+        let mut seqs = Vec::new();
+        while let Some(p) = t.next_probe(ms(0.0)) {
+            t.sent();
+            if let Some(&earlier) = seqs.last() {
+                for _ in 0..100 {
+                    assert_eq!(t.reply(&router(earlier), ms(1.0)), None);
+                }
+            }
+            assert!(t.reply(&router(p.seq), ms(1.0)).is_some());
+            for _ in 0..100 {
+                assert_eq!(t.reply(&router(p.seq), ms(1.0)), None);
+            }
+            t.timeout();
+            seqs.push(p.seq);
+        }
+        assert_eq!(seqs.len(), 4);
+        let hops = t.into_hops();
+        assert_eq!(hops.len(), 2);
+        fn kinds(e: &[String]) -> Vec<&str> {
+            e.iter()
+                .map(|e| e.split_once("\"from\"").unwrap().0)
+                .collect()
+        }
+        // hop 1: probe 1's answer and 16 of its duplicates; probe 2's late
+        // replies to probe 1 dropped; probe 2's answer
+        let mut one = vec![""];
+        one.extend([r#""dup":true, "#; EXTRA_PER_HOP]);
+        one.push("");
+        assert_eq!(kinds(&hops[0].entries), one);
+        // hop 2: 16 late replies to probe 2, which came in probe 3's wait,
+        // then the answers of probes 3 and 4
+        let mut two = vec![r#""late":1, "#; EXTRA_PER_HOP];
+        two.extend(["", ""]);
+        assert_eq!(kinds(&hops[1].entries), two);
     }
 
     #[test]

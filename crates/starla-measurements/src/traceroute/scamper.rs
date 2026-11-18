@@ -122,12 +122,20 @@ pub fn hops(
         let mut hop = Hop::new(ttl);
         let at_ttl: Vec<&Reply> = replies.iter().filter(|r| r.probe_ttl == ttl).collect();
         let last_id = at_ttl.iter().map(|r| r.probe_id).max().unwrap_or(0);
+        // duplicates written in this hop, as the engine caps them
+        let mut extra = 0;
         for id in 1..=attempts.max(last_id) {
             let mut answered = false;
             for r in at_ttl.iter().filter(|r| r.probe_id.max(1) == id) {
                 let Some(a) = answer(v6, protocol, r) else {
                     continue;
                 };
+                if answered {
+                    if extra >= engine::EXTRA_PER_HOP {
+                        continue;
+                    }
+                    extra += 1;
+                }
                 let rtt = r.rtt.as_secs_f64() * 1000.0;
                 hop.entries
                     .push(engine::entry(&a, None, answered, rtt, tos));
@@ -404,6 +412,23 @@ mod tests {
              \"rtt\":1.250 }, { \"from\":\"192.0.2.7\", \"ttl\":57, \"size\":68, \"rtt\":1.250, \
              \"err\":\"A\" } ] } ]"
         );
+    }
+
+    /// A hop keeps 16 duplicates besides its answers, as the engine's do.
+    #[test]
+    fn duplicates_are_capped_per_hop() {
+        let first = unreachable(1, 300);
+        let mut second = first.clone();
+        second.probe_id = 2;
+        let replies: Vec<Reply> = [first, second]
+            .iter()
+            .flat_map(|r| std::iter::repeat_n(r.clone(), 100))
+            .collect();
+        let h = hops(true, TracerouteProtocol::UDP, 0, 1, 1, 2, &replies);
+        let e = &h[0].entries;
+        assert_eq!(e.len(), 2 + engine::EXTRA_PER_HOP);
+        assert_eq!(e.iter().filter(|e| e.starts_with("\"dup\"")).count(), 16);
+        assert!(!e[engine::EXTRA_PER_HOP + 1].starts_with("\"dup\""));
     }
 
     /// The reference's last try after the gap limit is hop 255, numbered

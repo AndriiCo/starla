@@ -29,6 +29,16 @@ pub const GAP_MAX_MS: u64 = 60000;
 pub const COUNT_DEFAULT: u32 = 3;
 pub const TIMEOUT_DEFAULT_MS: u64 = 1000;
 
+/// The replies a run writes, per request of its `-c`: every one, a late
+/// reply and the answer of the request then in flight, say, up to twice
+/// the count. ready_callback writes every datagram of a header or more
+/// that comes while the run is busy (ntp.c:735-745), so a server that
+/// sends one again and again during the gap (`-g`, up to 60 s) grew the
+/// line without bound, until the uploader dropped it at 500 KB, and the
+/// result with it. A reply past these is still a reply, for the run's
+/// timers and the KoD hold, but has no entry.
+pub(crate) const REPLIES_PER_REQUEST: usize = 2;
+
 /// Convert NTP timestamp (64-bit: 32-bit seconds + 32-bit fraction) to
 /// f64, as ntp.c does: seconds + fraction / 2^32, in a double
 pub(super) fn ntp_ts_to_f64(ts: u64) -> f64 {
@@ -283,6 +293,10 @@ async fn run(config: &NtpConfig, kernel_rx: bool) -> anyhow::Result<NtpResult> {
     let mut gap_at: Option<tokio::time::Instant> = None;
     // Read errors in a row; past a few the socket waits for a timer
     let mut errors = 0;
+    // Replies written, and those past REPLIES_PER_REQUEST × count
+    let max_replies = (config.count as usize).saturating_mul(REPLIES_PER_REQUEST);
+    let mut replies = 0usize;
+    let mut dropped = 0usize;
     let mut buf = vec![0u8; 2048];
 
     // send_pkt (ntp.c:503-659): the next request, or the end of the run
@@ -349,7 +363,12 @@ async fn run(config: &NtpConfig, kernel_rx: bool) -> anyhow::Result<NtpResult> {
                 let t4 = stamp.map(ntp_ts).unwrap_or(t4);
                 if let Some(sample) = sample(&buf[..len], t4) {
                     result.said = result.said.and(said(&buf[..len], &sample.header, &t1s));
-                    result.samples.push(Some(sample));
+                    if replies < max_replies {
+                        replies += 1;
+                        result.samples.push(Some(sample));
+                    } else {
+                        dropped += 1;
+                    }
                     answered = true;
                     timeout_at = None;
                     send = !gap_pending || sent >= config.count;
@@ -380,6 +399,14 @@ async fn run(config: &NtpConfig, kernel_rx: bool) -> anyhow::Result<NtpResult> {
         }
     }
 
+    if dropped > 0 {
+        tracing::debug!(
+            "NTP: {} replies from {} past {} per request not written",
+            dropped,
+            dest,
+            REPLIES_PER_REQUEST
+        );
+    }
     Ok(result)
 }
 
@@ -632,6 +659,39 @@ mod tests {
         for s in res.samples.iter().flatten() {
             assert!((0.0..0.05).contains(&s.rtt), "{s:?}");
             assert!(s.offset.abs() < 0.05, "{s:?}");
+        }
+    }
+
+    /// A server that answers each request 50 times: the run writes twice
+    /// `-c` replies and no more, the first request's here, and the rest
+    /// still answer, so no request times out and the second still goes.
+    #[tokio::test]
+    async fn a_flood_of_replies_is_capped() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 48];
+            for _ in 0..2 {
+                let (_, from) = server.recv_from(&mut buf).await.unwrap();
+                tx.send(buf).unwrap();
+                let at = now_ntp();
+                for _ in 0..50 {
+                    server.send_to(&reply(&buf, at, at), from).await.unwrap();
+                }
+            }
+        });
+
+        let res = execute_ntp_query(&config(port, 2, 500, 300)).await.unwrap();
+        let mut requests = Vec::new();
+        while let Ok(r) = rx.try_recv() {
+            requests.push(r);
+        }
+        assert_eq!(requests.len(), 2);
+        assert_eq!(res.samples.len(), 2 * REPLIES_PER_REQUEST);
+        let t1 = ntp_ts_to_f64(u64::from_be_bytes(requests[0][40..48].try_into().unwrap()));
+        for s in &res.samples {
+            assert_eq!(s.as_ref().expect("answered").origin_ts, t1);
         }
     }
 
