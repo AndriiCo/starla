@@ -259,7 +259,7 @@ impl RawSock {
             }
         }
         Ok(Self {
-            fd: AsyncFd::new(sock)?,
+            fd: starla_network::register_socket(sock)?,
         })
     }
 

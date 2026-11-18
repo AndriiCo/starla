@@ -13,7 +13,9 @@ pub mod wsacmsg;
 pub use capabilities::*;
 pub use icmp::*;
 #[cfg(unix)]
-pub use raw_socket::{new_icmpv4_socket, new_icmpv6_socket, recvmsg_meta, RawSocket};
+pub use raw_socket::{
+    new_icmpv4_socket, new_icmpv6_socket, recvmsg_meta, register_socket, RawSocket,
+};
 
 /// What came with a packet: its TTL or hop limit, the address it was
 /// sent to, and the kernel's stamp of its arrival. On unix from recvmsg's

@@ -18,6 +18,19 @@ use std::os::fd::{AsRawFd, RawFd};
 use tokio::io::unix::AsyncFd;
 use tracing::trace;
 
+/// `socket` registered with the current tokio reactor, as
+/// `AsyncFd::new` did before tokio 1.54 deprecated it for I/O safety
+/// (tokio-rs/tokio#8587, RUSTSEC-2026-0386).
+///
+/// Must be called within a tokio runtime.
+pub fn register_socket(socket: Socket) -> io::Result<AsyncFd<Socket>> {
+    // SAFETY: the AsyncFd takes ownership of `socket`, a socket2::Socket
+    // that owns its descriptor: the descriptor stays open, and as_raw_fd()
+    // keeps returning it, until the AsyncFd drops it. Nothing hands out
+    // `&mut Socket` to swap it (callers use get_ref() only).
+    Ok(unsafe { AsyncFd::register(socket) }?)
+}
+
 /// A raw socket capable of sending and receiving packets
 pub struct RawSocket {
     /// The underlying async file descriptor
@@ -39,7 +52,7 @@ impl RawSocket {
                 socket.set_nonblocking(true)?;
                 trace!("Created unprivileged DGRAM ICMP socket");
                 return Ok(Self {
-                    inner: AsyncFd::new(socket)?,
+                    inner: register_socket(socket)?,
                     protocol,
                     is_dgram: true,
                 });
@@ -52,7 +65,7 @@ impl RawSocket {
         trace!("Created privileged RAW socket");
 
         Ok(Self {
-            inner: AsyncFd::new(socket)?,
+            inner: register_socket(socket)?,
             protocol,
             is_dgram: false,
         })
@@ -68,7 +81,7 @@ impl RawSocket {
         socket.set_nonblocking(true)?;
 
         Ok(Self {
-            inner: AsyncFd::new(socket)?,
+            inner: register_socket(socket)?,
             protocol,
             is_dgram: socket_type == Type::DGRAM,
         })
@@ -83,7 +96,7 @@ impl RawSocket {
                 socket.bind(&(*addr).into())?;
                 trace!("Created bound unprivileged DGRAM ICMP socket");
                 return Ok(Self {
-                    inner: AsyncFd::new(socket)?,
+                    inner: register_socket(socket)?,
                     protocol,
                     is_dgram: true,
                 });
@@ -95,7 +108,7 @@ impl RawSocket {
         socket.bind(&(*addr).into())?;
 
         Ok(Self {
-            inner: AsyncFd::new(socket)?,
+            inner: register_socket(socket)?,
             protocol,
             is_dgram: false,
         })
