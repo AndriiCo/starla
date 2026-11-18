@@ -127,8 +127,9 @@ impl ResultQueue {
     /// session down, any other answer than OK — they wait for the next one,
     /// as httppost's `--delete-file` only deletes the spool's files on an OK
     /// (httppost.c:602): only their age (`cleanup_expired`) and the queue's
-    /// size drop them.
-    pub fn requeue(&mut self, mut results: Vec<QueuedResult>) {
+    /// size drop them. How many results the size dropped.
+    #[must_use = "a result the queue's size dropped is a queue drop to record"]
+    pub fn requeue(&mut self, mut results: Vec<QueuedResult>) -> usize {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -139,30 +140,40 @@ impl ResultQueue {
             r.last_attempt_at = Some(now);
         }
 
-        self.push_front_moved(results);
+        self.push_front_moved(results)
     }
 
     /// Put results a post left out back at the front, in their order, no
     /// attempt counted: they did not fit its `--maxpostsize`, so they were
     /// not posted, as do_dir leaves a file that does not fit for the next
-    /// post (httppost.c:1118-1131).
-    pub fn put_back(&mut self, results: Vec<QueuedResult>) {
-        self.push_front_moved(results);
+    /// post (httppost.c:1118-1131). How many results the queue's size
+    /// dropped.
+    #[must_use = "a result the queue's size dropped is a queue drop to record"]
+    pub fn put_back(&mut self, results: Vec<QueuedResult>) -> usize {
+        self.push_front_moved(results)
     }
 
     /// Results a post took, back at the front in their order: still moved
     /// out, as a spool file httppost did not delete stays in data/out.
-    /// Over the capacity, the newest go.
-    fn push_front_moved(&mut self, results: Vec<QueuedResult>) {
+    /// Over the capacity the oldest go, as in
+    /// [`enqueue_measured`](Self::enqueue_measured): those at the front,
+    /// which may be some of `results` themselves. How many went.
+    fn push_front_moved(&mut self, results: Vec<QueuedResult>) -> usize {
         self.moved += results.len();
         for r in results.into_iter().rev() {
             self.items.push_front(r);
         }
 
-        while self.items.len() > self.max_capacity {
-            self.items.pop_back();
+        let over = self.items.len().saturating_sub(self.max_capacity);
+        if over > 0 {
+            self.items.drain(..over);
+            self.moved = self.moved.saturating_sub(over);
+            warn!(
+                "Queue full ({}), dropping the {} oldest results a post gave back",
+                self.max_capacity, over
+            );
         }
-        self.moved = self.moved.min(self.items.len());
+        over
     }
 
     /// Remove results older than `max_age_secs`. Returns number of items
@@ -264,7 +275,7 @@ mod tests {
         let batch = q.drain_batch(2);
         assert_eq!(q.stats().count, 0);
 
-        q.requeue(batch);
+        assert_eq!(q.requeue(batch), 0);
         assert_eq!(q.stats().count, 2);
 
         let batch = q.drain_batch(1);
@@ -280,7 +291,7 @@ mod tests {
         q.enqueue(make_result(2));
         for _ in 0..100 {
             let batch = q.drain_all();
-            q.requeue(batch);
+            assert_eq!(q.requeue(batch), 0);
         }
         q.enqueue(make_result(3));
         let back = q.drain_all();
@@ -327,8 +338,8 @@ mod tests {
         q.enqueue(make_result(5));
         let mut taken = q.drain_moved();
         let left_out = taken.split_off(2);
-        q.put_back(left_out);
-        q.requeue(taken);
+        assert_eq!(q.put_back(left_out), 0);
+        assert_eq!(q.requeue(taken), 0);
         assert_eq!((q.stats().count, q.stats().held), (5, 1));
         let again = q.drain_moved();
         assert_eq!(ids(&again), [1, 2, 3, 4]);
@@ -355,8 +366,31 @@ mod tests {
         assert_eq!((q.stats().count, q.stats().held), (1, 1));
         assert!(q.drain_moved().is_empty());
 
-        // Over the capacity, requeued results push out the newest
-        q.requeue(vec![q.items[0].clone(); 3]);
-        assert_eq!((q.stats().count, q.stats().held), (3, 0));
+        // Over the capacity, requeued results push out the oldest: here one
+        // of their own
+        assert_eq!(q.requeue(vec![q.items[0].clone(); 3]), 1);
+        assert_eq!((q.stats().count, q.stats().held), (3, 1));
+    }
+
+    /// A post's results given back to a queue that filled up meanwhile drop
+    /// the oldest, as a full queue does for a new result, and say how many:
+    /// the newest stay, moved out or held as they were.
+    #[test]
+    fn a_full_queue_drops_the_oldest_of_what_a_post_gives_back() {
+        let mut q = ResultQueue::new(4);
+        for id in 1..=3 {
+            q.enqueue(make_result(id));
+        }
+        q.move_out();
+        let mut taken = q.drain_moved();
+        for id in 4..=6 {
+            q.enqueue(make_result(id));
+        }
+        let left_out = taken.split_off(2);
+        assert_eq!(q.put_back(left_out), 0, "3 fits");
+        assert_eq!(q.requeue(taken), 2, "1 and 2 do not");
+        assert_eq!((q.stats().count, q.stats().held), (4, 3));
+        assert_eq!(ids(&q.drain_moved()), [3]);
+        assert_eq!(ids(&q.drain_all()), [4, 5, 6]);
     }
 }

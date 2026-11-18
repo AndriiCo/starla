@@ -729,6 +729,13 @@ impl ResultHandler {
         }
     }
 
+    /// Count `n` results a queue dropped.
+    fn record_queue_drops(&self, n: usize) {
+        for _ in 0..n {
+            self.metrics.record_queue_drop();
+        }
+    }
+
     /// Get current queue statistics
     pub async fn queue_stats(&self) -> QueueStats {
         self.take_submitted().await;
@@ -801,8 +808,9 @@ impl ResultHandler {
         let mut queue = self.queue.lock().await;
         // What --maxpostsize left out waits for the next post, as do_dir
         // leaves a file that does not fit: it was not posted, so no attempt
-        // is counted.
-        queue.put_back(deferred);
+        // is counted. Results queued while the post ran may have filled the
+        // queue: what no longer fits goes, the oldest first, as a drop.
+        let mut overflow = queue.put_back(deferred);
         let result = match outcome {
             Ok(()) => {
                 info!("Successfully uploaded {} results", sent.len());
@@ -818,10 +826,11 @@ impl ResultHandler {
                 // 429s in ~5 min dropped every result probe 1018212 measured
                 // while RIPE refused it, and on 2026-10-14 its KEEP
                 // disconnects dropped more.
-                queue.requeue(sent);
+                overflow += queue.requeue(sent);
                 Err(e)
             }
         };
+        self.record_queue_drops(overflow);
         self.metrics.update_queue_depth(queue.stats().count as i64);
         result
     }
@@ -869,7 +878,8 @@ impl ResultHandler {
             }
             let mut queue = self.oneoff_queue.lock().await;
             // Not posted: no attempt counted
-            queue.put_back(deferred);
+            let overflow = queue.put_back(deferred);
+            self.record_queue_drops(overflow);
             match outcome {
                 Ok(()) => {
                     info!("Posted {} one-off results", sent.len());
@@ -877,7 +887,8 @@ impl ResultHandler {
                 }
                 Err(e) => {
                     warn!("One-off post failed: {}", e);
-                    queue.requeue(sent);
+                    let overflow = queue.requeue(sent);
+                    self.record_queue_drops(overflow);
                     return Err(e);
                 }
             }
@@ -2138,7 +2149,7 @@ mod tests {
             .map(|r| (r.result.msm_id.0, r.attempts))
             .collect();
         assert_eq!(attempts, [(ids[3], 1), (ids[4], 1), (ids[5], 0)]);
-        handler.oneoff_queue.lock().await.put_back(waiting);
+        assert_eq!(handler.oneoff_queue.lock().await.put_back(waiting), 0);
 
         assert_eq!(handler.upload_oneoffs().await.unwrap(), 3);
         assert_eq!(
@@ -2630,7 +2641,7 @@ mod tests {
         let waiting = handler.queue.lock().await.drain_all();
         assert_eq!(waiting.len(), 1);
         assert_eq!(waiting[0].attempts, 0, "not posted: no attempt");
-        handler.queue.lock().await.put_back(waiting);
+        assert_eq!(handler.queue.lock().await.put_back(waiting), 0);
         assert_eq!(handler.upload_pending().await.unwrap(), 1);
         assert_eq!(handler.queue_stats().await.count, 0);
         let (_, first) = seen.try_recv().unwrap();
