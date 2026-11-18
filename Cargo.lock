@@ -4480,7 +4480,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
- "rand 0.10.4",
+ "rand",
  "rustls",
  "serde_json",
  "starla-common",
