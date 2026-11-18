@@ -22,7 +22,7 @@ use starla_controller::{SshConnection, SshConfig, KnownHosts, generate_key};
 let key = generate_key()?;
 
 // Load known host keys (TOFU verification)
-let known_hosts = KnownHosts::load(Path::new("data/known_hosts"));
+let known_hosts = KnownHosts::load(Path::new("data/known_hosts"))?;
 
 // Connect to registration servers
 let ssh = SshConnection::connect_to_servers(

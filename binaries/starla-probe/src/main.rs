@@ -714,7 +714,10 @@ async fn run_background(background: Background) -> Result<()> {
 
     // Load known SSH host keys for server verification
     let known_hosts_path = starla_common::known_hosts_path();
-    let known_hosts = KnownHosts::load(&known_hosts_path);
+    // An unreadable file is fatal, as an unreadable probe key is: running
+    // on an empty list would trust every server afresh and overwrite the
+    // pins.
+    let known_hosts = KnownHosts::load(&known_hosts_path)?;
 
     // Try to connect to registration servers
     let ssh_config = SshConfig {

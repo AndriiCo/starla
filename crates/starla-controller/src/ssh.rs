@@ -280,39 +280,82 @@ fn read_os_release() -> (Option<String>, Option<String>) {
 /// On first connection to a server, the key is saved to a known_hosts file.
 /// On subsequent connections, the presented key is verified against the saved
 /// one. This prevents MITM attacks after the initial connection.
+///
+/// The file is the operator's pins as much as Starla's record: a file that
+/// exists but cannot be read is an error, never an empty list that the next
+/// save would write over, and a save keeps every line it does not parse
+/// (comments included) as it found it.
 #[derive(Clone)]
 pub struct KnownHosts {
     path: PathBuf,
     hosts: Arc<Mutex<HashMap<String, String>>>,
+    /// Lines that are not entries -- comments, anything unparsed -- written
+    /// back first, in their order, on each save.
+    kept: Arc<Vec<String>>,
 }
 
-impl KnownHosts {
-    /// Load known hosts from file, or create empty if file doesn't exist
-    pub fn load(path: &Path) -> Self {
-        let mut hosts = HashMap::new();
+/// The header a save writes; not kept from the file, so it is not repeated.
+const KNOWN_HOSTS_HEADER: &str = "# Starla known hosts - do not edit manually";
 
-        if path.exists() {
-            if let Ok(contents) = std::fs::read_to_string(path) {
-                for line in contents.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-                    // Format: "host:port key_type base64_key"
-                    let parts: Vec<&str> = line.splitn(3, ' ').collect();
-                    if parts.len() == 3 {
-                        let host_port = parts[0].to_string();
-                        let key_str = format!("{} {}", parts[1], parts[2]);
-                        hosts.insert(host_port, key_str);
-                    }
+impl KnownHosts {
+    /// Load known hosts from `path`; a file that does not exist is an empty
+    /// list. One that exists but cannot be read (permissions, not UTF-8)
+    /// is an error: treating it as empty would trust every server afresh
+    /// and replace the pins at the next save.
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("cannot read known hosts {}: {}", path.display(), e),
+                ))
+            }
+        };
+
+        let mut hosts = HashMap::new();
+        let mut kept = Vec::new();
+        for raw in contents.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line == KNOWN_HOSTS_HEADER {
+                continue;
+            }
+            // Format: "host:port key_type base64_key"
+            let parts: Vec<&str> = line.splitn(3, ' ').collect();
+            if !line.starts_with('#') && parts.len() == 3 {
+                hosts.insert(parts[0].to_string(), format!("{} {}", parts[1], parts[2]));
+            } else {
+                if !line.starts_with('#') {
+                    warn!("known_hosts: keeping a line it cannot parse: {}", line);
                 }
+                kept.push(raw.to_string());
             }
         }
 
-        Self {
+        Ok(Self {
             path: path.to_path_buf(),
             hosts: Arc::new(Mutex::new(hosts)),
+            kept: Arc::new(kept),
+        })
+    }
+
+    /// The file's text for `hosts`: the header, the kept lines, then the
+    /// entries sorted, so a save changes only what changed.
+    fn render(&self, hosts: &HashMap<String, String>) -> String {
+        let mut entries: Vec<_> = hosts.iter().collect();
+        entries.sort();
+        let mut out = String::new();
+        out.push_str(KNOWN_HOSTS_HEADER);
+        out.push('\n');
+        for line in self.kept.iter() {
+            out.push_str(line);
+            out.push('\n');
         }
+        for (hp, k) in entries {
+            out.push_str(&format!("{} {}\n", hp, k));
+        }
+        out
     }
 
     /// Check a server's public key against known hosts.
@@ -361,24 +404,14 @@ impl KnownHosts {
             );
             hosts.insert(host_port.clone(), presented);
 
-            // Write back to file atomically (write temp then rename)
+            // Created 0600 under a temp name, fsynced, renamed into place:
+            // never a half-written file, never one that follows a symlink
+            // planted at the temp name.
             if let Some(parent) = self.path.parent() {
                 let _ = std::fs::create_dir_all(parent);
-                let tmp_path = parent.join(".known_hosts.tmp");
-                let mut lines: Vec<String> = Vec::new();
-                lines.push("# Starla known hosts - do not edit manually".to_string());
-                for (hp, k) in hosts.iter() {
-                    lines.push(format!("{} {}", hp, k));
-                }
-                match std::fs::write(&tmp_path, lines.join("\n") + "\n") {
-                    Ok(()) => {
-                        if let Err(e) = std::fs::rename(&tmp_path, &self.path) {
-                            warn!("Failed to rename known_hosts: {}", e);
-                            let _ = std::fs::remove_file(&tmp_path);
-                        }
-                    }
-                    Err(e) => warn!("Failed to save known_hosts: {}", e),
-                }
+            }
+            if let Err(e) = write_private_file(&self.path, self.render(&hosts).as_bytes()) {
+                warn!("Failed to save known_hosts: {}", e);
             }
 
             Ok(true)
@@ -1666,8 +1699,14 @@ mod tests {
     #[test]
     fn a_traced_init_line_leaves_the_session_id_out() {
         use super::redact_init_line;
-        assert_eq!(redact_init_line("SESSION_ID abc123"), "SESSION_ID <redacted>");
-        assert_eq!(redact_init_line("  SESSION_ID\tabc123"), "SESSION_ID <redacted>");
+        assert_eq!(
+            redact_init_line("SESSION_ID abc123"),
+            "SESSION_ID <redacted>"
+        );
+        assert_eq!(
+            redact_init_line("  SESSION_ID\tabc123"),
+            "SESSION_ID <redacted>"
+        );
         assert_eq!(redact_init_line("REMOTE_PORT 2222"), "REMOTE_PORT 2222");
         assert_eq!(redact_init_line("SESSION_IDX y"), "SESSION_IDX y");
     }
@@ -1977,7 +2016,7 @@ mod tests {
             443,
             &key,
             quick_config(),
-            KnownHosts::load(&dir.path().join("known_hosts")),
+            KnownHosts::load(&dir.path().join("known_hosts")).unwrap(),
         );
         let Err(e) = timeout(Duration::from_secs(10), login)
             .await
@@ -2021,7 +2060,7 @@ mod tests {
             443,
             &key,
             quick_config(),
-            KnownHosts::load(&dir.path().join("known_hosts")),
+            KnownHosts::load(&dir.path().join("known_hosts")).unwrap(),
         );
         let Err(e) = timeout(Duration::from_secs(10), login)
             .await
@@ -2077,7 +2116,7 @@ mod tests {
             443,
             &generate_key().unwrap(),
             SshConfig::default(),
-            KnownHosts::load(&dir.path().join("known_hosts")),
+            KnownHosts::load(&dir.path().join("known_hosts")).unwrap(),
         )
         .await
         .unwrap();
@@ -2223,7 +2262,7 @@ mod tests {
             443,
             &generate_key().unwrap(),
             SshConfig::default(),
-            KnownHosts::load(&dir.path().join("known_hosts")),
+            KnownHosts::load(&dir.path().join("known_hosts")).unwrap(),
         )
         .await
         .unwrap();
@@ -2406,7 +2445,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_matches_on_blob_across_algorithm_names() {
         let path = tmp_path("xalgo");
-        let kh = KnownHosts::load(&path);
+        let kh = KnownHosts::load(&path).unwrap();
 
         let priv_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let pub_key = priv_key.public_key();
@@ -2426,7 +2465,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_rejects_different_blob() {
         let path = tmp_path("mitm");
-        let kh = KnownHosts::load(&path);
+        let kh = KnownHosts::load(&path).unwrap();
 
         let pinned = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let attacker = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
@@ -2448,7 +2487,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_tofu_on_first_sight() {
         let path = tmp_path("tofu");
-        let kh = KnownHosts::load(&path);
+        let kh = KnownHosts::load(&path).unwrap();
 
         let priv_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let ok = kh
@@ -2464,6 +2503,83 @@ mod tests {
         assert!(ok, "subsequent verifications with the same key must match");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A known_hosts that exists but cannot be read is an error, not an
+    /// empty list whose first save would replace the pins; a missing one
+    /// is an empty list.
+    #[test]
+    fn an_unreadable_known_hosts_is_an_error_and_a_missing_one_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("known_hosts");
+        assert!(KnownHosts::load(&missing).is_ok());
+
+        let not_utf8 = dir.path().join("not_utf8");
+        std::fs::write(&not_utf8, b"reg:443 ssh-ed25519 \xff\xfe\n").unwrap();
+        let err = KnownHosts::load(&not_utf8).err().expect("not UTF-8");
+        assert!(err.to_string().contains("cannot read known hosts"), "{err}");
+
+        // A directory where the file should be: read_to_string fails with
+        // something other than NotFound, as EACCES would (and as root,
+        // which a 000 file would not stop).
+        let a_dir = dir.path().join("a_dir");
+        std::fs::create_dir(&a_dir).unwrap();
+        assert!(KnownHosts::load(&a_dir).is_err());
+    }
+
+    /// The pins an operator seeds survive Starla's first save: their
+    /// entries, their comments and any line it cannot parse, and the file
+    /// stays owner-only.
+    #[tokio::test]
+    async fn a_save_keeps_the_seeded_pins_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let pinned = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let pin = format!(
+            "reg-05.prod.atlas.ripe.net:443 ssh-ed25519 {}",
+            pinned.public_key().public_key_base64()
+        );
+        std::fs::write(&path, format!("# seeded by hand\n#\n{pin}\nnot-an-entry\n")).unwrap();
+
+        let kh = KnownHosts::load(&path).unwrap();
+        let controller = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        assert!(kh
+            .verify("ctr-sea01.atlas.ripe.net", 443, controller.public_key())
+            .await
+            .unwrap());
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# seeded by hand\n#\n"), "{saved}");
+        assert!(saved.contains(&pin), "{saved}");
+        assert!(saved.contains("\nnot-an-entry\n"), "{saved}");
+        assert!(
+            saved.contains("ctr-sea01.atlas.ripe.net:443 ssh-ed25519 "),
+            "{saved}"
+        );
+        assert_eq!(saved.matches(KNOWN_HOSTS_HEADER).count(), 1, "{saved}");
+
+        // Loaded again, the pin still holds against another key, and a
+        // second save does not repeat the kept lines.
+        let again = KnownHosts::load(&path).unwrap();
+        let other = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        assert!(!again
+            .verify("reg-05.prod.atlas.ripe.net", 443, other.public_key())
+            .await
+            .unwrap());
+        assert!(again
+            .verify("ctr-ams01.atlas.ripe.net", 443, other.public_key())
+            .await
+            .unwrap());
+        let resaved = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(resaved.matches("# seeded by hand").count(), 1, "{resaved}");
+        assert_eq!(resaved.matches("not-an-entry").count(), 1, "{resaved}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 
     #[test]
