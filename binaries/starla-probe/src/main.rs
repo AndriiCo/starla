@@ -814,8 +814,10 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
         let _ = std::fs::remove_file(&con_keep_path);
     }
 
-    // Registration loop: retries indefinitely with backoff
-    let mut reg_delay = Duration::from_secs(5);
+    // Registration loop: retries indefinitely with backoff. Every back-off
+    // wait below is slept [`jittered`]; the waits a server names are not.
+    let min_reg_delay = Duration::from_secs(5);
+    let mut reg_delay = min_reg_delay;
     let max_reg_delay = Duration::from_secs(300);
 
     // Outer loop: re-runs register → controller-connect if the initial
@@ -824,7 +826,8 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
     // us out from KEEP (a forced registration, then a new session). Keeps
     // the process alive so launchd / systemd don't penalty-box a fast-exit
     // cycle.
-    let mut ctrl_delay = Duration::from_secs(5);
+    let min_ctrl_delay = Duration::from_secs(5);
+    let mut ctrl_delay = min_ctrl_delay;
     let max_ctrl_delay = Duration::from_secs(60);
 
     // The result upload loop is the process's, started at the first KEEP
@@ -849,7 +852,7 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
                     result_cancel_token.cancel();
                     return Ok(());
                 }
-                _ = tokio::time::sleep(ctrl_delay) => {
+                _ = tokio::time::sleep(jittered(ctrl_delay, min_ctrl_delay, max_ctrl_delay)) => {
                     ctrl_delay = std::cmp::min(ctrl_delay * 2, max_ctrl_delay);
                     continue $outer;
                 }
@@ -950,7 +953,7 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
                             result_cancel_token.cancel();
                             return Ok(());
                         }
-                        _ = tokio::time::sleep(reg_delay) => {
+                        _ = tokio::time::sleep(jittered(reg_delay, min_reg_delay, max_reg_delay)) => {
                             reg_delay = std::cmp::min(reg_delay * 2, max_reg_delay);
                             continue;
                         }
@@ -986,7 +989,7 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
 
                     reg.registered(&info, unix_now());
                     save_reg(&reg, &reg_path);
-                    reg_delay = Duration::from_secs(5);
+                    reg_delay = min_reg_delay;
                     break info;
                 }
                 Ok(InitResponse::Refused { reason }) => {
@@ -1043,7 +1046,10 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
                     result_cancel_token.cancel();
                     return Ok(());
                 }
-                _ = tokio::time::sleep(server_wait.unwrap_or(reg_delay)) => {
+                // A server's wait as it asked; Starla's own back-off spread
+                _ = tokio::time::sleep(server_wait.unwrap_or_else(|| {
+                    jittered(reg_delay, min_reg_delay, max_reg_delay)
+                })) => {
                     if server_wait.is_none() {
                         reg_delay = std::cmp::min(reg_delay * 2, max_reg_delay);
                     }
@@ -1264,7 +1270,8 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
                         Ok(ssh) => ssh,
                         Err(e) => {
                             error!("Failed to connect for KEEP: {}", e);
-                            let wait = keep_waits.connect_failed();
+                            let wait =
+                                jittered(keep_waits.connect_failed(), REKEEP_FIRST, REKEEP_MAX);
                             warn!("Retrying connection in {:?}...", wait);
                             tokio::select! {
                                 _ = shutdown.cancelled() => {
@@ -1282,7 +1289,7 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
                     // SSH handler routes directly to telnet command parser
                     if let Err(e) = keep_ssh.request_reverse_tunnel(remote_port).await {
                         error!("Failed to setup reverse tunnel: {}", e);
-                        let wait = keep_waits.connect_failed();
+                        let wait = jittered(keep_waits.connect_failed(), REKEEP_FIRST, REKEEP_MAX);
                         warn!("Retrying connection in {:?}...", wait);
                         tokio::select! {
                             _ = shutdown.cancelled() => {
@@ -1394,6 +1401,7 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
                         }
                         AfterKeep::Rekeep { why, wait } => {
                             warn!("{}", why);
+                            let wait = jittered(wait, REKEEP_FIRST, REKEEP_MAX);
                             if session_uptime < STABLE_SESSION {
                                 debug!(
                                     "Session lasted only {:?} (< {:?}); escalating backoff to {:?}",
@@ -1423,10 +1431,11 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
                 result_cancel_token.cancel();
             }
             Err(e) => {
+                let wait = jittered(ctrl_delay, min_ctrl_delay, max_ctrl_delay);
                 error!(
                     "Failed to connect to controller: {} — retrying in {}s",
                     e,
-                    ctrl_delay.as_secs()
+                    wait.as_secs()
                 );
                 {
                     let mut s = probe_status.lock().await;
@@ -1441,7 +1450,7 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
                         result_cancel_token.cancel();
                         return Ok(());
                     }
-                    _ = tokio::time::sleep(ctrl_delay) => {
+                    _ = tokio::time::sleep(wait) => {
                         ctrl_delay = std::cmp::min(ctrl_delay * 2, max_ctrl_delay);
                         continue 'register_and_connect;
                     }
@@ -2023,6 +2032,37 @@ const REKEEP_MAX: Duration = Duration::from_secs(300);
 const KICKED_FIRST: Duration = Duration::from_secs(60);
 const KICKED_MAX: Duration = Duration::from_secs(180);
 
+/// How far [`jittered`] spreads a back-off's wait, each way.
+const JITTER: f64 = 0.2;
+
+/// A back-off's wait `base`, between `floor` and `cap`, spread at random by
+/// up to ±[`JITTER`] (±20%): probes that lost their registration server or
+/// controller together (an outage, a restart) would otherwise all come back
+/// on the same 5, 10, 20 … s and hit it in lockstep at each step. The
+/// result stays within `floor` and `cap`. A `base` past `cap` is no step
+/// of the back-off but a fixed wait (DEFAULT_WAIT_SECS after a controller's
+/// refusal): it is only ever lengthened. A wait a server names (WAIT,
+/// TIMEOUT, CON_WAIT_TIMER) does not come through here.
+fn jittered(base: Duration, floor: Duration, cap: Duration) -> Duration {
+    use rand::RngExt;
+    spread(
+        base,
+        floor,
+        cap,
+        rand::rng().random_range(1.0 - JITTER..=1.0 + JITTER),
+    )
+}
+
+/// [`jittered`] with its random factor given.
+fn spread(base: Duration, floor: Duration, cap: Duration, factor: f64) -> Duration {
+    let wait = base.mul_f64(factor);
+    if base > cap {
+        wait.max(base)
+    } else {
+        wait.clamp(floor.min(base), cap)
+    }
+}
+
 /// How a KEEP task ended.
 #[derive(Debug, PartialEq)]
 enum KeepEnded {
@@ -2523,6 +2563,39 @@ mod tests {
         waits.new_session();
         assert_eq!(waits.rekeep, REKEEP_FIRST);
         assert_eq!(rekeep_in(waits.after(lost(), quick)), 10);
+    }
+
+    /// A back-off's wait is spread ±20%, inside its floor and its cap: 10 s
+    /// goes 8 to 12 s, the first wait never below the floor, the capped
+    /// one never above the cap; a fixed wait past the cap is never
+    /// shortened.
+    #[test]
+    fn backoff_waits_are_spread_within_their_bounds() {
+        let s = Duration::from_secs;
+        let (floor, cap) = (s(5), s(300));
+        assert_eq!(spread(s(10), floor, cap, 0.8), s(8));
+        assert_eq!(spread(s(10), floor, cap, 1.2), s(12));
+        assert_eq!(spread(s(5), floor, cap, 0.8), s(5), "floor kept");
+        assert_eq!(spread(s(5), floor, cap, 1.2), s(6));
+        assert_eq!(spread(s(300), floor, cap, 0.8), s(240));
+        assert_eq!(spread(s(300), floor, cap, 1.2), s(300), "cap kept");
+        // A controller's refusal: DEFAULT_WAIT_SECS past the 60 s cap
+        let refused = s(DEFAULT_WAIT_SECS as u64);
+        assert_eq!(spread(refused, floor, s(60), 0.8), refused);
+        assert_eq!(spread(refused, floor, s(60), 1.2), s(120));
+    }
+
+    /// The random factor stays within ±20%, and does spread: a thousand
+    /// waits of 10 s are not all the same.
+    #[test]
+    fn jittered_waits_vary_within_twenty_percent() {
+        let s = Duration::from_secs;
+        let waits: Vec<Duration> = (0..1000)
+            .map(|_| jittered(s(10), REKEEP_FIRST, REKEEP_MAX))
+            .collect();
+        assert!(waits.iter().all(|w| (s(8)..=s(12)).contains(w)));
+        let (min, max) = (waits.iter().min().unwrap(), waits.iter().max().unwrap());
+        assert!(*max - *min > s(2), "spread {min:?}..{max:?}");
     }
 
     /// A crontab as the controller sends one: its CRONLINEs, each parsed.
