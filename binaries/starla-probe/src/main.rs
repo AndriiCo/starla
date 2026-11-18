@@ -1204,8 +1204,11 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
                                 // force_reg.sh; the wait before re-registering is
                                 // Starla's own, so a refusal does not spin.
                                 warn!(
-                                    "Controller refused us ({}); registering again in {}s",
-                                    reason, DEFAULT_WAIT_SECS
+                                    "Controller refused us ({}); registering again in {}-{}s",
+                                    reason,
+                                    DEFAULT_WAIT_SECS,
+                                    // jittered() lengthens a wait past the cap by up to JITTER
+                                    (DEFAULT_WAIT_SECS as f64 * (1.0 + JITTER)) as i64
                                 );
                                 reg.refused(&reason);
                                 save_reg(&reg, &reg_path);
