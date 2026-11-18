@@ -23,9 +23,17 @@
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.flake-utils.follows = "flake-utils";
     };
+    # RustSec's advisory database, for checks.audit. Only its files are
+    # read, so it is not a flake. The weekly `nix flake update` moves it
+    # forward with the other inputs, and the `nix flake check` that follows
+    # audits Cargo.lock against the new advisories.
+    advisory-db = {
+      url = "github:rustsec/advisory-db";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, rust-overlay, flake-utils, git-hooks, nix-appimage }:
+  outputs = { self, nixpkgs, rust-overlay, flake-utils, git-hooks, nix-appimage, advisory-db }:
     flake-utils.lib.eachDefaultSystem
       (system:
         let
@@ -475,6 +483,23 @@
               '';
               installPhase = "touch $out";
             };
+
+            # cargo audit of Cargo.lock against the advisory-db input. The
+            # sandbox has no network: --no-fetch reads the pinned database
+            # as it is. The yanked-crate check needs the crates.io index, so
+            # here it prints "couldn't open crates.io index" and is skipped.
+            # A vulnerability fails the check; unmaintained and unsound
+            # warnings are printed and allowed, as cargo audit does by
+            # default.
+            audit = pkgs.runCommand "starla-audit"
+              {
+                nativeBuildInputs = [ pkgs.cargo-audit ];
+              } ''
+              export HOME=$(mktemp -d)
+              cargo-audit audit --db ${advisory-db} --no-fetch \
+                --file ${./Cargo.lock}
+              touch $out
+            '';
 
             # Full package builds
             build = self.packages.${system}.default;
