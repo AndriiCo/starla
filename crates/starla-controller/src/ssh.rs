@@ -471,6 +471,13 @@ impl KnownHosts {
     }
 }
 
+/// The ports Starla has asked the controller to forward to it (the KEEP
+/// session's REMOTE_PORT). A forwarded-tcpip channel for any other port is
+/// refused: russh confirms whatever the server opens unless the handler
+/// does not, and a channel the probe never asked for must not reach the
+/// telnet command parser.
+type Forwards = Arc<std::sync::Mutex<std::collections::HashSet<u32>>>;
+
 /// Client handler for russh
 struct AtlasClientHandler {
     /// Known hosts for server key verification
@@ -486,6 +493,8 @@ struct AtlasClientHandler {
     probe_id: u32,
     /// Session ID for telnet authentication
     session_id: Arc<tokio::sync::RwLock<Option<String>>>,
+    /// The ports a forwarded channel may be for
+    forwards: Forwards,
 }
 
 impl AtlasClientHandler {
@@ -506,6 +515,7 @@ impl AtlasClientHandler {
             command_tx,
             probe_id,
             session_id,
+            forwards: Forwards::default(),
         }
     }
 }
@@ -551,6 +561,17 @@ impl client::Handler for AtlasClientHandler {
             "Forwarded connection from {}:{} to {}:{}",
             originator_address, originator_port, connected_address, connected_port
         );
+
+        if !self.forwards.lock().unwrap().contains(&connected_port) {
+            warn!(
+                "Refusing a forwarded channel for port {} from {}:{}: Starla asked for no forwarding there",
+                connected_port, originator_address, originator_port
+            );
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        }
 
         // Since russh 0.62 the handler confirms the channel itself, and a
         // dropped `reply` rejects it. Confirm before the telnet session can
@@ -690,6 +711,8 @@ pub struct SshConnection {
     session: Arc<Mutex<Handle<AtlasClientHandler>>>,
     host: String,
     port: u16,
+    /// The handler's [`Forwards`]
+    forwards: Forwards,
 }
 
 impl SshConnection {
@@ -754,6 +777,7 @@ impl SshConnection {
         handler: AtlasClientHandler,
     ) -> anyhow::Result<Self> {
         let (stream, cut) = Cuttable::new(stream);
+        let forwards = handler.forwards.clone();
         let login_timeout = config.login_timeout();
         let login = async {
             let session = timeout_at(
@@ -762,11 +786,14 @@ impl SshConnection {
             )
             .await
             .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
-            timeout(login_timeout, Self::authenticate(session, host, port, key))
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("SSH login: no answer from the server in {login_timeout:?}")
-                })?
+            timeout(
+                login_timeout,
+                Self::authenticate(session, host, port, key, forwards),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("SSH login: no answer from the server in {login_timeout:?}")
+            })?
         };
         let logged_in = login.await;
         if logged_in.is_err() {
@@ -781,6 +808,7 @@ impl SshConnection {
         host: &str,
         port: u16,
         key: &PrivateKey,
+        forwards: Forwards,
     ) -> anyhow::Result<Self> {
         // Authenticate. Ed25519 keys don't need an RSA hash; pass None.
         let auth_res = session
@@ -800,6 +828,7 @@ impl SshConnection {
             session: Arc::new(Mutex::new(session)),
             host: host.to_string(),
             port,
+            forwards,
         })
     }
 
@@ -1230,9 +1259,17 @@ impl SshConnection {
             anyhow::bail!("SSH session is closed, cannot setup tunnel");
         }
 
+        // Allowed before the request goes out: the controller may open a
+        // channel as soon as it has answered
+        let port = u32::from(bind_port);
+        self.forwards.lock().unwrap().insert(port);
+
         // Use "localhost" as the bind address, matching OpenSSH behavior
         // The server will listen on localhost:bind_port
-        session.tcpip_forward("localhost", bind_port as u32).await?;
+        if let Err(e) = session.tcpip_forward("localhost", port).await {
+            self.forwards.lock().unwrap().remove(&port);
+            return Err(e.into());
+        }
 
         Ok(())
     }
@@ -1242,6 +1279,7 @@ impl SshConnection {
         debug!("Cancelling reverse tunnel on port {}", bind_port);
 
         let session = self.session.lock().await;
+        self.forwards.lock().unwrap().remove(&u32::from(bind_port));
         session
             .cancel_tcpip_forward("127.0.0.1", bind_port as u32)
             .await?;
@@ -2791,5 +2829,68 @@ mod tests {
         )
         .await;
         assert!(conn.is_err());
+    }
+
+    /// A controller that grants every forwarding request and can then open
+    /// forwarded-tcpip channels to the probe through `handle`
+    struct Forwarder;
+
+    impl russh::server::Handler for Forwarder {
+        type Error = anyhow::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            _: &str,
+            _: russh::server::VerifiedPublicKey<'_>,
+        ) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn tcpip_forward(
+            &mut self,
+            _: &str,
+            _: &mut u32,
+            _: &mut russh::server::Session,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_channel_is_accepted_only_for_the_port_starla_asked_for() {
+        let (probe, controller) = tokio::io::duplex(1 << 16);
+        let server = russh::server::Config {
+            keys: vec![generate_key().unwrap()],
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        let running = russh::server::run_stream(Arc::new(server), controller, Forwarder);
+        let dir = tempfile::tempdir().unwrap();
+        let known = KnownHosts::load(&dir.path().join("known_hosts")).unwrap();
+        let key = generate_key().unwrap();
+        let connect =
+            SshConnection::connect_stream(probe, "ctr-test", 443, &key, quick_config(), known);
+        let (running, conn) = tokio::join!(running, connect);
+        let running = running.unwrap();
+        let conn = conn.unwrap();
+        let handle = running.handle();
+        tokio::spawn(running);
+
+        let open = |port| {
+            let handle = handle.clone();
+            async move {
+                handle
+                    .channel_open_forwarded_tcpip("localhost", port, "193.0.0.1", 40000)
+                    .await
+            }
+        };
+        // Nothing asked for yet
+        assert!(open(2222).await.is_err());
+
+        conn.request_reverse_tunnel(2222).await.unwrap();
+        assert!(open(2223).await.is_err(), "another port");
+        assert!(open(22).await.is_err(), "another port");
+        assert!(open(2222).await.is_ok(), "the forwarded port");
     }
 }
