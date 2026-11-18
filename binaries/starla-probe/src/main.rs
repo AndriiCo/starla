@@ -1031,10 +1031,9 @@ async fn run_background(background: Background) -> Result<()> {
                                 remote_port,
                                 session_id,
                             }) => {
-                                info!(
-                                    "Controller ready, remote port: {}, session_id: {}",
-                                    remote_port, session_id
-                                );
+                                // The session ID is the telnet password and
+                                // the upload's credential: never logged.
+                                info!("Controller ready, remote port: {}", remote_port);
                                 con_keep.set_ready(remote_port, session_id.clone());
                                 save_con_keep(&con_keep, &con_keep_path);
                                 break (remote_port, session_id);
@@ -1135,7 +1134,10 @@ async fn run_background(background: Background) -> Result<()> {
                 // Set result upload endpoint path (query params for HTTP POST)
                 let endpoint_path =
                     format!("/?PROBE_ID={}&SESSION_ID={}", actual_probe_id, session_id);
-                debug!("Result upload endpoint path: {}", endpoint_path);
+                debug!(
+                    "Result upload endpoint path: /?PROBE_ID={}&SESSION_ID=<redacted>",
+                    actual_probe_id
+                );
                 result_handler
                     .set_endpoint_path(endpoint_path)
                     .await

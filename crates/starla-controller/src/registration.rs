@@ -124,14 +124,8 @@ impl RegState {
 
     /// Write it atomically (temp file, then rename), owner-only.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let tmp = path.with_extension("new");
-        std::fs::write(&tmp, self.render())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(&tmp, path)
+        // Created 0600 rather than chmodded after the write
+        crate::ssh::write_private_file(path, self.render().as_bytes())
     }
 
     fn parse(text: &str) -> Self {
@@ -244,14 +238,8 @@ impl ConKeep {
 
     /// Write it atomically (temp file, then rename), owner-only.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let tmp = path.with_extension("new");
-        std::fs::write(&tmp, self.render())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(&tmp, path)
+        // Created 0600, never chmodded after: it holds the session ID.
+        crate::ssh::write_private_file(path, self.render().as_bytes())
     }
 
     fn parse(text: &str) -> Self {
@@ -457,6 +445,25 @@ mod tests {
         assert_eq!(back.rereg_at, Some(NOW + 3_600));
         assert_eq!(back.controller.unwrap().probe_id, 1018212);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The session ID is a credential: con_keep_conf.txt is owner-only
+    /// from the moment it exists, never world-readable between a write and
+    /// a chmod, and a save over an old file keeps that.
+    #[cfg(unix)]
+    #[test]
+    fn con_keep_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("con_keep_conf.txt");
+        let mut keep = ConKeep::default();
+        keep.set_ready(2222, "s3cret".into());
+        keep.save(&path).unwrap();
+        keep.save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(ConKeep::load(&path).session_id.as_deref(), Some("s3cret"));
+        assert!(!path.with_extension("tmp").exists());
     }
 
     #[test]

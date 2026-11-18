@@ -841,7 +841,7 @@ pub fn parse_init_response(output: &str) -> anyhow::Result<InitResponse> {
         let first_line = lines[0].trim();
         debug!("INIT response: {} ({} lines)", first_line, lines.len());
         for (i, line) in lines.iter().enumerate().skip(1) {
-            trace!("INIT response line {}: {}", i + 1, line);
+            trace!("INIT response line {}: {}", i + 1, redact_init_line(line));
         }
 
         match first_line {
@@ -908,7 +908,7 @@ pub fn parse_init_response(output: &str) -> anyhow::Result<InitResponse> {
 
                     if parts[0] == "SESSION_ID" && parts.len() >= 2 {
                         session_id = Some(parts[1].to_string());
-                        debug!("Controller assigned session ID: {}", parts[1]);
+                        debug!("Controller assigned a session ID");
                     }
                 }
 
@@ -1589,8 +1589,18 @@ pub async fn save_key(key: &PrivateKey, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// An INIT reply line as it may be logged: SESSION_ID's value, the telnet
+/// password and the upload's credential, is left out.
+fn redact_init_line(line: &str) -> std::borrow::Cow<'_, str> {
+    if line.split_whitespace().next() == Some("SESSION_ID") {
+        "SESSION_ID <redacted>".into()
+    } else {
+        line.into()
+    }
+}
+
 /// Write `contents` to `path` through a `0600` temp file and a rename.
-fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
     let tmp = path.with_extension("tmp");
@@ -1651,6 +1661,17 @@ pub async fn load_or_create_key(path: &Path) -> anyhow::Result<(PrivateKey, bool
 
 #[cfg(test)]
 mod tests {
+    /// SESSION_ID is the telnet password: a traced INIT reply leaves its
+    /// value out and keeps every other line.
+    #[test]
+    fn a_traced_init_line_leaves_the_session_id_out() {
+        use super::redact_init_line;
+        assert_eq!(redact_init_line("SESSION_ID abc123"), "SESSION_ID <redacted>");
+        assert_eq!(redact_init_line("  SESSION_ID\tabc123"), "SESSION_ID <redacted>");
+        assert_eq!(redact_init_line("REMOTE_PORT 2222"), "REMOTE_PORT 2222");
+        assert_eq!(redact_init_line("SESSION_IDX y"), "SESSION_IDX y");
+    }
+
     #[tokio::test]
     async fn public_key_openssh_matches_the_pub_file() {
         // The banner shows this string and probe_key.pub holds it; if the
