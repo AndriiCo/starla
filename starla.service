@@ -23,6 +23,12 @@ StateDirectory=starla
 StateDirectoryMode=0750
 RuntimeDirectory=starla
 RuntimeDirectoryMode=0750
+# Files Starla creates (probe_id, paused_until, the status socket) are its
+# own alone. The directory modes above are set by systemd, not the umask.
+# Nothing outside the service reads them: the tray connects to the socket in
+# its own user's $XDG_RUNTIME_DIR, which is this service's only when both run
+# as the same user, and root reads the state directory regardless.
+UMask=0077
 
 AmbientCapabilities=CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_RAW
@@ -30,11 +36,18 @@ CapabilityBoundingSet=CAP_NET_RAW
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+# /dev holds only the pseudo-devices (null, zero, urandom, ...); Starla opens
+# no device node. Raw sockets for ping and traceroute need no device.
+PrivateDevices=true
 ProtectClock=true
 ProtectHostname=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
+# Other users' processes are hidden from /proc. Not ProcSubset=pid: host
+# telemetry reads /proc/uptime, /proc/buddyinfo, /proc/net and /proc/sys.
+ProtectProc=invisible
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
@@ -50,6 +63,10 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 # calls capset.
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged
+# A filtered system call fails with EPERM rather than killing the process,
+# so a library probing for one it may not use (and falling back) keeps
+# working, and a real need shows up as an error in the log, not a SIGSYS.
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

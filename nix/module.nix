@@ -171,6 +171,9 @@ in
         StateDirectoryMode = "0750";
         RuntimeDirectory = "starla";
         RuntimeDirectoryMode = "0750";
+        # Files Starla creates (probe_id, paused_until, the status socket)
+        # are its own alone; see starla.service.
+        UMask = "0077";
 
         # Raw sockets for ping and traceroute
         AmbientCapabilities = [ "CAP_NET_RAW" ];
@@ -180,11 +183,16 @@ in
         ProtectSystem = "strict";
         ProtectHome = true;
         PrivateTmp = true;
+        PrivateDevices = true;
         ProtectClock = true;
         ProtectHostname = true;
         ProtectKernelModules = true;
         ProtectKernelTunables = true;
+        ProtectKernelLogs = true;
         ProtectControlGroups = true;
+        # Not ProcSubset = "pid": host telemetry reads /proc/uptime,
+        # /proc/buddyinfo, /proc/net and /proc/sys.
+        ProtectProc = "invisible";
         RestrictNamespaces = true;
         RestrictRealtime = true;
         RestrictSUIDSGID = true;
@@ -194,6 +202,7 @@ in
         SystemCallArchitectures = "native";
         RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" "AF_NETLINK" ];
         SystemCallFilter = [ "@system-service" "~@privileged" ];
+        SystemCallErrorNumber = "EPERM";
         ExecStart = "${cfg.package}/bin/starla --config %E/starla/config.toml";
       } // lib.optionalAttrs (cfg.sshKeyFile != null) {
         LoadCredential = [ "ssh-key:${cfg.sshKeyFile}" ];
