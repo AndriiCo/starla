@@ -1207,7 +1207,6 @@ impl UploadGate {
             self.backoff = Duration::from_secs(1);
             return;
         };
-        self.consecutive_failures += 1;
         if is_rate_limited(&e) {
             // A 429 is a refusal, not a plain failure: it steps its own
             // backoff and does not inflate `consecutive_failures`, which
@@ -1222,6 +1221,7 @@ impl UploadGate {
             );
             self.hold_until = Some(tick + hold);
         } else {
+            self.consecutive_failures += 1;
             warn!(
                 "Upload failed (attempt {}): {}",
                 self.consecutive_failures, e
@@ -1420,6 +1420,26 @@ mod tests {
         assert_eq!(secs(1, Some(300)), 300);
         assert_eq!(secs(4, Some(30)), 480);
         assert_eq!(secs(1, Some(86_400)), 3600);
+    }
+
+    /// A 429 holds posts for its own hold and leaves the plain failures'
+    /// count alone: after it, three plain failures in a row are still
+    /// tolerated, and the fourth starts the backoff.
+    #[test]
+    fn a_429_does_not_count_toward_the_failure_backoff() {
+        let mut gate = UploadGate::default();
+        let t0 = Instant::now();
+        gate.after_post(t0, Err(RateLimited { retry_after: None }.into()));
+        assert!(gate.holds(t0 + Duration::from_secs(59)));
+        let after = t0 + Duration::from_secs(60);
+        assert!(!gate.holds(after), "the 429's minute is over");
+
+        for n in 1..=3 {
+            gate.after_post(after, Err(anyhow::anyhow!("connection reset")));
+            assert!(!gate.holds(after), "plain failure {n} holds nothing");
+        }
+        gate.after_post(after, Err(anyhow::anyhow!("connection reset")));
+        assert!(gate.holds(after), "the fourth plain failure backs off");
     }
 
     /// A controller that answers every POST with 429, no Retry-After, as
