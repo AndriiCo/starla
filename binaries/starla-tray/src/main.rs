@@ -452,13 +452,7 @@ impl App {
 /// Mirror the pause file into the cached status so the menu reflects
 /// the change before the probe's next status push.
 fn refresh_status_from_disk(status: &Arc<Mutex<Option<ProbeStatus>>>) {
-    let pause = starla_common::read_pause_state().and_then(|s| {
-        if s.is_active(Utc::now()) {
-            Some(s)
-        } else {
-            None
-        }
-    });
+    let pause = starla_common::read_pause_state().filter(|s| s.is_active(Utc::now()));
     let mut guard = status.lock().unwrap();
     if let Some(ref mut s) = *guard {
         s.pause = pause;
