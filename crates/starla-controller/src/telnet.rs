@@ -1298,8 +1298,80 @@ mod telnet_filter_tests {
 
 /// Parse a command line into a TelnetCommand
 ///
-/// Supports both JSON format and Atlas busybox CRONLINE format
+/// Supports both JSON format and Atlas busybox CRONLINE format. A command
+/// with a string the controller gave that is not fit to be written where it
+/// goes ([`unfit_string`]) is Unknown.
 pub fn parse_command(cmd: &str) -> TelnetCommand {
+    let command = parse_command_fields(cmd);
+    match unfit_string(&command) {
+        Some(field) => {
+            warn!(
+                "Refusing a command whose {} is not printable ASCII without quotes and \
+                 backslashes: {:?}",
+                field, cmd
+            );
+            TelnetCommand::Unknown(cmd.to_string())
+        }
+        None => command,
+    }
+}
+
+/// Whether `s` may be a name the results write as it is: a target, a URL,
+/// a server name. Results put the target in `"dst_name":"…"` (and DNS's
+/// `"name"`, the error texts) with no escaping, as the reference prints
+/// it with %s; the results crate splits a line at a '\n' and DNS's acts on
+/// a '\x01'. A hostname, an IPv4 or IPv6 literal (with brackets or a
+/// `%zone`) and a URL need none of a control byte, a space, a '"', a '\\'
+/// or a byte past ASCII. The CRONLINE tokenizer drops '"' but keeps the
+/// rest, and a JSON line can hold any of them.
+fn is_name(s: &str) -> bool {
+    s.bytes()
+        .all(|b| (0x21..=0x7e).contains(&b) && b != b'"' && b != b'\\')
+}
+
+/// Whether `s` may be text the probe writes on (a User-Agent, a header,
+/// condmv's `-A` marker): printable ASCII, spaces included, so no line
+/// break or other control byte.
+fn is_text(s: &str) -> bool {
+    s.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
+/// The first of `command`'s controller-given strings that a result line or
+/// a request would carry and that is not fit for it, by name: targets,
+/// URLs and names ([`is_name`]), free text ([`is_text`]).
+fn unfit_string(command: &TelnetCommand) -> Option<&'static str> {
+    let name = |field, s: &str| (!is_name(s)).then_some(field);
+    let some_name = |field, s: &Option<String>| s.as_deref().and_then(|s| name(field, s));
+    let text = |field, s: &str| (!is_text(s)).then_some(field);
+    match command {
+        TelnetCommand::Ping(spec) => name("target", &spec.target),
+        TelnetCommand::Traceroute(spec) => name("target", &spec.target),
+        TelnetCommand::Dns(spec) => name("target", &spec.target),
+        TelnetCommand::Ntp(spec) => name("target", &spec.target),
+        TelnetCommand::Tls(spec) => {
+            name("target", &spec.target).or_else(|| some_name("hostname", &spec.hostname))
+        }
+        TelnetCommand::Http(spec) => name("url", &spec.url)
+            .or_else(|| name("method", &spec.method))
+            .or_else(|| some_name("sni", &spec.sni))
+            .or_else(|| some_name("host", &spec.host))
+            .or_else(|| {
+                spec.user_agent
+                    .as_deref()
+                    .and_then(|s| text("user agent", s))
+            })
+            .or_else(|| spec.headers.iter().find_map(|h| text("header", h))),
+        TelnetCommand::Httppost(spec) => name("url", &spec.url),
+        TelnetCommand::Condmv(spec) => name("file", &spec.from)
+            .or_else(|| name("file", &spec.to))
+            .or_else(|| spec.append.as_deref().and_then(|s| text("-A marker", s))),
+        TelnetCommand::Oneoff(command) => unfit_string(command),
+        _ => None,
+    }
+}
+
+/// [`parse_command`], its strings unchecked
+fn parse_command_fields(cmd: &str) -> TelnetCommand {
     // Try to parse as JSON first
     if cmd.starts_with('{') {
         if let Ok(spec) = serde_json::from_str::<serde_json::Value>(cmd) {
@@ -3036,6 +3108,133 @@ mod tests {
     fn test_parse_status_command() {
         let cmd = parse_command("STATUS");
         assert!(matches!(cmd, TelnetCommand::Status));
+    }
+
+    /// A CRONLINE and a ONEOFF for `target` of each tool that takes a target
+    fn target_lines(target: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        for tool in [
+            "evping -4 -c 3 -A \"1001\"",
+            "evtraceroute -4 -A \"1002\"",
+            "evtdig -4 -h -A \"1003\"",
+            "evsslgetcert -4 -A \"1004\"",
+            "evntp -4 -A \"1005\"",
+        ] {
+            lines.push(format!(
+                "CRONLINE 240 1 1794447121 UNIFORM 3 {tool} -O /home/atlas/data/new/7 {target}"
+            ));
+            lines.push(format!("ONEOFF /home/atlas/crons/oneoff {tool} {target}"));
+        }
+        lines
+    }
+
+    /// evhttpget's CRONLINE and ONEOFF for `url`, and httppost's CRONLINE
+    fn url_lines(url: &str) -> Vec<String> {
+        vec![
+            format!("CRONLINE 3600 1 1794447121 UNIFORM 3 evhttpget -4 -A \"1006\" {url}"),
+            format!("ONEOFF /home/atlas/crons/oneoff evhttpget -4 -A \"1006\" {url}"),
+            format!(
+                "CRONLINE 60 12 2000000000 UNIFORM 20 httppost --post-dir /home/atlas/data/out {url}"
+            ),
+        ]
+    }
+
+    #[test]
+    fn targets_and_urls_with_characters_none_has_are_refused() {
+        let known = |line: &str| !matches!(parse_command(line), TelnetCommand::Unknown(_));
+        for target in [
+            "k.root-servers.net",
+            "www.office.com.",
+            "_dmarc.example",
+            "193.0.14.129",
+            "2001:7fd::1",
+            "::ffff:192.0.2.1",
+            "fe80::1%eth0",
+            "[2001:db8::1]",
+        ] {
+            for line in target_lines(target) {
+                assert!(known(&line), "{line}");
+            }
+        }
+        for url in [
+            "http://[2001:67c:2e8:16::c100:68d]",
+            "https://193.0.6.139/",
+            "http://127.0.0.1:8080/?PROBE_ID=1018212&SESSION_ID=5345a14cdcdc",
+            "http://example.com:8080/a/b;c?x=1&y=%20z#frag",
+            "https://[fe80::1%25eth0]:443/~user/!$'()*+,=@",
+        ] {
+            for line in url_lines(url) {
+                assert!(known(&line), "{line}");
+            }
+        }
+
+        // A '\', a control byte, DEL, a byte past ASCII: the tokenizer keeps
+        // them all, and a target or URL with one is refused, in a ONEOFF too.
+        // (A vertical tab is no example: ONEOFF splits its line at any white
+        // space, CRONLINE at blanks.)
+        for bad in ["a\\nb", "a\x01b", "a\x7fb", "caf\u{e9}.example"] {
+            for line in target_lines(&format!("{bad}.example"))
+                .into_iter()
+                .chain(url_lines(&format!("http://{bad}/")))
+            {
+                assert!(!known(&line), "{line:?}");
+            }
+        }
+        // The rest of an evhttpget line too, and condmv's marker
+        for line in [
+            "CRONLINE 900 1 1794447121 UNIFORM 3 evhttpget --sni a\\b -A \"1\" https://193.0.6.139/",
+            "CRONLINE 900 1 1794447121 UNIFORM 3 evhttpget --host a\x01b -A \"1\" http://193.0.6.139/",
+            "CRONLINE 900 1 1794447121 UNIFORM 3 evhttpget --user-agent \"a\x0bb\" -A \"1\" http://193.0.6.139/",
+            "CRONLINE 900 1 1794447121 UNIFORM 3 evsslgetcert -h a\\b -A \"1\" 193.0.6.139",
+            "CRONLINE 60 1 2000000000 UNIFORM 14 condmv -A \"RESULT 9901\x01\" /home/atlas/data/new/2 /home/atlas/data/out/2",
+            "CRONLINE 60 1 2000000000 UNIFORM 14 condmv -A \"RESULT 9901\" /home/atlas/data/new/2\\x /home/atlas/data/out/2",
+        ] {
+            assert!(!known(line), "{line:?}");
+        }
+        // Spaces are fine in a User-Agent and a marker, as RIPE sends them
+        for line in [
+            "CRONLINE 900 1 1794447121 UNIFORM 3 evhttpget --user-agent \"RIPE Atlas test agent/1.0\" -A \"1\" http://193.0.6.139/",
+            "CRONLINE 60 1 2000000000 UNIFORM 14 condmv -A \"RESULT 9901 ongoing\" /home/atlas/data/new/2 /home/atlas/data/out/2",
+        ] {
+            assert!(known(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn json_strings_that_would_break_a_result_line_are_refused() {
+        let known = |line: &str| !matches!(parse_command(line), TelnetCommand::Unknown(_));
+        for kind in ["ping", "traceroute", "dns", "tls", "ntp"] {
+            let ok = format!(r#"{{"type":"{kind}","msm_id":1,"target":"192.0.2.1"}}"#);
+            assert!(known(&ok), "{ok}");
+            // A quote ends dst_name's string and a line break the RESULT
+            // line; a backslash, a control byte and a byte past ASCII
+            for bad in [
+                r#"192.0.2.1\", \"dst_addr\":\"x"#,
+                r#"192.0.2.1\nRESULT { \"id\":\"1\" }"#,
+                r#"192.0.2.1\u0001"#,
+                r#"a\\b"#,
+                r#"a b"#,
+                r#"café.example"#,
+            ] {
+                let line = format!(r#"{{"type":"{kind}","msm_id":1,"target":"{bad}"}}"#);
+                assert!(!known(&line), "{line}");
+            }
+        }
+        let http = |fields: &str| format!(r#"{{"type":"http","msm_id":1,{fields}}}"#);
+        assert!(known(&http(
+            r#""url":"http://192.0.2.1/x?y=1","headers":["X-A: b c"]"#
+        )));
+        for fields in [
+            r#""url":"http://192.0.2.1/\"x""#,
+            r#""url":"http://192.0.2.1/\r\nX: y""#,
+            r#""url":"http://192.0.2.1/","headers":["X-A: b\r\nX-B: c"]"#,
+            r#""url":"http://192.0.2.1/","sni":"a\nb""#,
+            r#""url":"http://192.0.2.1/","method":"GET /\r\n""#,
+        ] {
+            assert!(!known(&http(fields)), "{fields}");
+        }
+        let tls = r#"{"type":"tls","msm_id":1,"target":"192.0.2.1","hostname":"a\"b"}"#;
+        assert!(!known(tls));
     }
 
     #[test]
