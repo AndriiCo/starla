@@ -311,7 +311,10 @@ fn main() -> Result<()> {
     };
 
     // Held to the end of main: the log is written only while it lives.
-    let _log_guard = init_logging(log_config)?;
+    let log_guard = init_logging(log_config)?;
+    // SIGTERM shuts the probe down as SIGINT does (run_background); the
+    // log's own SIGTERM hook only ends a shutdown that hangs.
+    log_guard.shut_down_gracefully_on_sigterm(SIGTERM_GRACE);
 
     info!(
         "Starla v{} (fw {})",
@@ -433,6 +436,49 @@ fn main() -> Result<()> {
     ended
 }
 
+/// How long a SIGTERM leaves the probe to shut down by itself, its last
+/// post included ([`starla_results::SHUTDOWN_POST_TIMEOUT`]), before the
+/// log's SIGTERM hook writes the log out and ends it: inside systemd's
+/// default 90 s TimeoutStopSec, whose SIGKILL would lose the queued lines.
+const SIGTERM_GRACE: Duration = Duration::from_secs(45);
+
+/// Cancels `shutdown` on SIGINT or, on unix, SIGTERM: Ctrl+C, and how
+/// systemd, launchd and docker stop the probe. A SIGTERM used to end the
+/// process where it stood, and every result still queued in memory with it.
+async fn watch_for_shutdown(shutdown: CancellationToken) {
+    let interrupt = async {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => "SIGINT",
+            Err(e) => {
+                warn!("Ctrl+C will not stop the probe gracefully: {}", e);
+                std::future::pending().await
+            }
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                term.recv().await;
+                "SIGTERM"
+            }
+            Err(e) => {
+                warn!("SIGTERM will not stop the probe gracefully: {}", e);
+                std::future::pending().await
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<&str>();
+    let which = tokio::select! {
+        which = interrupt => which,
+        which = terminate => which,
+    };
+    info!("Received {}, shutting down", which);
+    shutdown.cancel();
+}
+
 /// What the background runtime takes over from [`main`].
 struct Background {
     config: starla_common::ProbeConfig,
@@ -452,8 +498,29 @@ struct Background {
 /// (runtimes.rs): the metrics server, the tray's pause, the controller's
 /// commands, host telemetry, the status socket, registration and the
 /// controller connection, and the result handler's uploads. Returns when the
-/// probe shuts down.
+/// probe shuts down, once the result handler has made its last post.
 async fn run_background(background: Background) -> Result<()> {
+    let result_handler = Arc::clone(&background.result_handler);
+    let shutdown = CancellationToken::new();
+    tokio::spawn(watch_for_shutdown(shutdown.clone()));
+
+    let ended = run_probe(background, shutdown).await;
+    // Every way out of run_probe but an error cancels the result handler;
+    // its last post needs this runtime, which ends when this returns.
+    if ended.is_ok() {
+        let wait = starla_results::SHUTDOWN_POST_TIMEOUT + Duration::from_secs(5);
+        if tokio::time::timeout(wait, result_handler.stopped())
+            .await
+            .is_err()
+        {
+            warn!("The result handler did not stop within {:?}", wait);
+        }
+    }
+    ended
+}
+
+/// [`run_background`]'s work, until `shutdown` or an error.
+async fn run_probe(background: Background, shutdown: CancellationToken) -> Result<()> {
     let Background {
         config,
         runtime_dir,
@@ -775,8 +842,8 @@ async fn run_background(background: Background) -> Result<()> {
     macro_rules! ctrl_retry {
         ($outer:lifetime) => {{
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Received Ctrl+C during controller-connect retry");
+                _ = shutdown.cancelled() => {
+                    info!("Shutting down during controller-connect retry");
                     scheduler_cancel.cancel();
                     metrics_cancel_token.cancel();
                     result_cancel_token.cancel();
@@ -817,8 +884,8 @@ async fn run_background(background: Background) -> Result<()> {
                         secs
                     );
                     tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {
-                            info!("Received Ctrl+C");
+                        _ = shutdown.cancelled() => {
+                            info!("Shutting down");
                             scheduler_cancel.cancel();
                             metrics_cancel_token.cancel();
                             result_cancel_token.cancel();
@@ -876,8 +943,8 @@ async fn run_background(background: Background) -> Result<()> {
                         explained = true;
                     }
                     tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {
-                            info!("Received Ctrl+C");
+                        _ = shutdown.cancelled() => {
+                            info!("Shutting down");
                             scheduler_cancel.cancel();
                             metrics_cancel_token.cancel();
                             result_cancel_token.cancel();
@@ -960,8 +1027,8 @@ async fn run_background(background: Background) -> Result<()> {
             };
 
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Received Ctrl+C");
+                _ = shutdown.cancelled() => {
+                    info!("Shutting down");
                     scheduler_cancel.cancel();
                     metrics_cancel_token.cancel();
                     result_cancel_token.cancel();
@@ -1008,8 +1075,8 @@ async fn run_background(background: Background) -> Result<()> {
                     let secs = (until - unix_now()).max(1) as u64;
                     info!("The controller asked us to wait; retrying in {}s", secs);
                     tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {
-                            info!("Received Ctrl+C during wait");
+                        _ = shutdown.cancelled() => {
+                            info!("Shutting down during wait");
                             metrics_cancel_token.cancel();
                             result_cancel_token.cancel();
                             return Ok(());
@@ -1055,8 +1122,8 @@ async fn run_background(background: Background) -> Result<()> {
                                 con_keep.set_wait(unix_now() + wait_secs);
                                 save_con_keep(&con_keep, &con_keep_path);
                                 tokio::select! {
-                                    _ = tokio::signal::ctrl_c() => {
-                                        info!("Received Ctrl+C during wait");
+                                    _ = shutdown.cancelled() => {
+                                        info!("Shutting down during wait");
                                         metrics_cancel_token.cancel();
                                         result_cancel_token.cancel();
                                         return Ok(());
@@ -1079,8 +1146,8 @@ async fn run_background(background: Background) -> Result<()> {
                                     "Controller said OK but no REMOTE_PORT, retrying in 30 seconds"
                                 );
                                 tokio::select! {
-                                    _ = tokio::signal::ctrl_c() => {
-                                        info!("Received Ctrl+C during wait");
+                                    _ = shutdown.cancelled() => {
+                                        info!("Shutting down during wait");
                                         metrics_cancel_token.cancel();
                                         result_cancel_token.cancel();
                                         return Ok(());
@@ -1191,8 +1258,8 @@ async fn run_background(background: Background) -> Result<()> {
                             let wait = keep_waits.connect_failed();
                             warn!("Retrying connection in {:?}...", wait);
                             tokio::select! {
-                                _ = tokio::signal::ctrl_c() => {
-                                    info!("Received Ctrl+C during reconnect wait");
+                                _ = shutdown.cancelled() => {
+                                    info!("Shutting down during reconnect wait");
                                     break 'connection_loop;
                                 }
                                 _ = tokio::time::sleep(wait) => {
@@ -1208,8 +1275,15 @@ async fn run_background(background: Background) -> Result<()> {
                         error!("Failed to setup reverse tunnel: {}", e);
                         let wait = keep_waits.connect_failed();
                         warn!("Retrying connection in {:?}...", wait);
-                        tokio::time::sleep(wait).await;
-                        continue 'connection_loop;
+                        tokio::select! {
+                            _ = shutdown.cancelled() => {
+                                info!("Shutting down during reconnect wait");
+                                break 'connection_loop;
+                            }
+                            _ = tokio::time::sleep(wait) => {
+                                continue 'connection_loop;
+                            }
+                        }
                     }
                     debug!("Reverse tunnel established: remote port {}", remote_port);
 
@@ -1256,8 +1330,8 @@ async fn run_background(background: Background) -> Result<()> {
 
                     // Wait for shutdown or connection loss
                     let keep_end = tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {
-                            info!("Received Ctrl+C");
+                        _ = shutdown.cancelled() => {
+                            info!("Shutting down");
                             None
                         }
                         _ = &mut scheduler_task => {
@@ -1297,8 +1371,8 @@ async fn run_background(background: Background) -> Result<()> {
                                 Some(refused.to_string());
                             force_reregistration(&reg_path);
                             tokio::select! {
-                                _ = tokio::signal::ctrl_c() => {
-                                    info!("Received Ctrl+C during re-registration wait");
+                                _ = shutdown.cancelled() => {
+                                    info!("Shutting down during re-registration wait");
                                     break 'connection_loop;
                                 }
                                 // Back to the top, with the scheduler, telnet,
@@ -1321,8 +1395,8 @@ async fn run_background(background: Background) -> Result<()> {
                             // Wait before reconnecting
                             debug!("Reconnecting in {:?}...", wait);
                             tokio::select! {
-                                _ = tokio::signal::ctrl_c() => {
-                                    info!("Received Ctrl+C during reconnect wait");
+                                _ = shutdown.cancelled() => {
+                                    info!("Shutting down during reconnect wait");
                                     break 'connection_loop;
                                 }
                                 _ = tokio::time::sleep(wait) => {
@@ -1351,8 +1425,8 @@ async fn run_background(background: Background) -> Result<()> {
                     s.last_connection_error = Some(e.to_string());
                 }
                 tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        info!("Received Ctrl+C during controller-connect retry");
+                    _ = shutdown.cancelled() => {
+                        info!("Shutting down during controller-connect retry");
                         scheduler_cancel.cancel();
                         metrics_cancel_token.cancel();
                         result_cancel_token.cancel();

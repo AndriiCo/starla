@@ -25,6 +25,7 @@
 use crate::priority::{Nice, BACKGROUND_NICE_INCREMENT};
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 use tracing::Subscriber;
@@ -98,6 +99,10 @@ pub struct LogGuard {
     /// writer.
     worker: Arc<Mutex<Option<Writer>>>,
     dropped: ErrorCounter,
+    /// How long, in milliseconds, the SIGTERM thread leaves the process to
+    /// shut down by itself before it stops the writer and ends it
+    /// ([`LogGuard::shut_down_gracefully_on_sigterm`]); 0 until set.
+    sigterm_grace_ms: Arc<AtomicU64>,
 }
 
 /// The writer thread, as the guard holds it.
@@ -116,6 +121,19 @@ impl LogGuard {
         self.dropped.dropped_lines()
     }
 
+    /// The process handles SIGTERM itself and shuts down within `grace`:
+    /// the SIGTERM thread then waits that long before it writes out the
+    /// queue and ends the process by SIGTERM's default action, so it only
+    /// ever cuts off a shutdown that hangs. Without this, a SIGTERM ends the
+    /// process at once, its queued lines written out first.
+    ///
+    /// `grace` has to stay below systemd's TimeoutStopSec (90 s by
+    /// default), or the SIGKILL that follows it loses the queued lines.
+    pub fn shut_down_gracefully_on_sigterm(&self, grace: Duration) {
+        let ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
+        self.sigterm_grace_ms.store(ms, Ordering::Relaxed);
+    }
+
     /// Makes a SIGTERM write out the queued lines before the process dies of
     /// it.
     ///
@@ -127,9 +145,10 @@ impl LogGuard {
     /// sees a process killed by SIGTERM, a clean stop, and at most
     /// [`FLUSH_TIMEOUT`] later than before.
     ///
-    /// If Starla ever shuts down gracefully on SIGTERM, as it does on
-    /// SIGINT, this hook has to go: it would end the process under that
-    /// shutdown.
+    /// The probe shuts down gracefully on SIGTERM, as it does on SIGINT,
+    /// and says so with [`LogGuard::shut_down_gracefully_on_sigterm`]: this
+    /// hook then waits out that grace before it acts, a bound on a shutdown
+    /// that hangs, rather than ending the process under it.
     #[cfg(unix)]
     fn flush_on_sigterm(&self) -> io::Result<()> {
         use std::io::Read;
@@ -138,6 +157,7 @@ impl LogGuard {
         let (mut woken, wake) = UnixStream::pair()?;
         wake.set_nonblocking(true)?;
         let worker = Arc::clone(&self.worker);
+        let grace_ms = Arc::clone(&self.sigterm_grace_ms);
         std::thread::Builder::new()
             .name("starla-log-term".to_string())
             .spawn(move || {
@@ -149,6 +169,12 @@ impl LogGuard {
                         // The handler is gone: it was never registered.
                         _ => return,
                     }
+                }
+                // A graceful shutdown ends the process before this wakes;
+                // one that hangs is ended here, its log written out.
+                let grace = Duration::from_millis(grace_ms.load(Ordering::Relaxed));
+                if !grace.is_zero() {
+                    std::thread::sleep(grace);
                 }
                 stop_writer(&worker);
                 die_of_sigterm();
@@ -430,6 +456,7 @@ where
             finished,
         }))),
         dropped,
+        sigterm_grace_ms: Arc::new(AtomicU64::new(0)),
     };
     (writer, guard)
 }
@@ -1109,6 +1136,55 @@ mod tests {
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );
+        let log = String::from_utf8_lossy(&out.stdout);
+        let lines = log.lines().filter(|l| l.contains("term line")).count();
+        assert_eq!(lines, SIGTERM_LINES, "{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "a child process of a_shutdown_that_hangs_is_ended_after_the_grace"]
+    fn child_sigterm_grace() {
+        if !is_child("child_sigterm_grace") {
+            return;
+        }
+        let log = init_logging(LogConfig {
+            log_dir: None,
+            level: "info".to_string(),
+            json_format: false,
+        })
+        .expect("init logging");
+        log.shut_down_gracefully_on_sigterm(Duration::from_millis(500));
+        for i in 0..SIGTERM_LINES {
+            tracing::info!("term line {i} of {SIGTERM_LINES}");
+        }
+        eprintln!("{READY}");
+        // SAFETY: kill(2) of this process.
+        unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        // A shutdown that never finishes
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    /// With a grace set, a SIGTERM leaves the process that long to shut
+    /// down by itself; one that does not is still ended by the SIGTERM,
+    /// its queued lines written out, and not before the grace.
+    #[cfg(unix)]
+    #[test]
+    fn a_shutdown_that_hangs_is_ended_after_the_grace() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let started = Instant::now();
+        let out = run_child("child_sigterm_grace", &[], true);
+        assert_eq!(
+            out.status.signal(),
+            Some(libc::SIGTERM),
+            "child ended {}:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(started.elapsed() >= Duration::from_millis(500));
         let log = String::from_utf8_lossy(&out.stdout);
         let lines = log.lines().filter(|l| l.contains("term line")).count();
         assert_eq!(lines, SIGTERM_LINES, "{log}");

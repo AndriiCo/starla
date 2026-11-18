@@ -32,7 +32,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -314,6 +314,9 @@ pub struct ResultHandler {
     lines_changed: Notify,
     wall_clock: WallClock,
     metrics: starla_metrics::MetricsRegistry,
+    /// Whether [`run`](Self::run) is under way, its shutdown post
+    /// included: what [`stopped`](Self::stopped) waits on.
+    running: watch::Sender<bool>,
 }
 
 impl ResultHandler {
@@ -367,6 +370,69 @@ impl ResultHandler {
             lines_changed: Notify::new(),
             wall_clock: Arc::new(system_wall_clock),
             metrics,
+            running: watch::Sender::new(false),
+        }
+    }
+
+    /// Wait until [`run`](Self::run) has ended, its shutdown post done; at
+    /// once if it is not running. The probe waits on this before its
+    /// runtime goes, which would otherwise end the post under way.
+    pub async fn stopped(&self) {
+        let mut running = self.running.subscribe();
+        let _ = running.wait_for(|&r| !r).await;
+    }
+
+    /// What is left at shutdown, once [`run`](Self::run) is cancelled: one
+    /// post of the queued one-offs and one of what data/out holds, within
+    /// [`SHUTDOWN_POST_TIMEOUT`], unless a 429 holds posts. The queue lives
+    /// in memory only, so whatever is still in it after that is lost with
+    /// the process, and is logged as lost. Results still in data/new/7,
+    /// behind crons/7's next condmv, are not posted ahead of it.
+    async fn post_at_shutdown(&self, gate: &UploadGate) {
+        if gate.holds(Instant::now()) {
+            info!("Posts are held after a 429; nothing posted at shutdown");
+        } else {
+            let posting = async {
+                if let Err(e) = self.upload_oneoffs().await {
+                    debug!("One-off post at shutdown failed: {}", e);
+                }
+                let has_moved = {
+                    self.take_submitted().await;
+                    let stats = self.queue.lock().await.stats();
+                    // With no condmv line, a post moves everything out
+                    if self.sink.condmv_line.load(Ordering::Relaxed) {
+                        stats.count > stats.held
+                    } else {
+                        stats.count > 0
+                    }
+                };
+                if has_moved {
+                    let target = self.main_target().await;
+                    if let Err(e) = self.upload_pending_to(&target).await {
+                        debug!("Post at shutdown failed: {}", e);
+                    }
+                }
+            };
+            if tokio::time::timeout(SHUTDOWN_POST_TIMEOUT, posting)
+                .await
+                .is_err()
+            {
+                warn!(
+                    "Post at shutdown timed out after {:?}",
+                    SHUTDOWN_POST_TIMEOUT
+                );
+            }
+        }
+
+        self.take_submitted().await;
+        let main = self.queue.lock().await.stats().count;
+        let oneoffs = self.oneoff_queue.lock().await.stats().count;
+        if main + oneoffs > 0 {
+            warn!(
+                "Shutting down with {} results not posted ({} one-offs); they are lost",
+                main + oneoffs,
+                oneoffs
+            );
         }
     }
 
@@ -937,6 +1003,15 @@ impl ResultHandler {
     /// Run the upload loop
     pub async fn run(&self, cancel: CancellationToken) -> anyhow::Result<()> {
         info!("Result handler starting");
+        // Not running again once this ends, however it ends
+        self.running.send_replace(true);
+        struct Stopped<'a>(&'a watch::Sender<bool>);
+        impl Drop for Stopped<'_> {
+            fn drop(&mut self) {
+                self.0.send_replace(false);
+            }
+        }
+        let _stopped = Stopped(&self.running);
 
         let started = Instant::now();
         let mut cleanup_interval = tokio::time::interval(self.config.cleanup_interval);
@@ -983,6 +1058,7 @@ impl ResultHandler {
             tokio::select! {
                 _ = cancel.cancelled() => {
                     debug!("Result handler shutting down");
+                    self.post_at_shutdown(&gate).await;
                     break;
                 }
 
@@ -1166,6 +1242,9 @@ fn is_rate_limited(e: &anyhow::Error) -> bool {
 
 /// The controller's crontab posts `&SRC=timesync` every 900 s.
 const TIMESYNC_INTERVAL: Duration = Duration::from_secs(900);
+/// How long the posts at shutdown may take, all of them: well inside
+/// systemd's 90 s TimeoutStopSec and the probe's SIGTERM grace.
+pub const SHUTDOWN_POST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// eooqd's re-post timer (eooqd.c:271).
 const ONEOFF_REPOST: Duration = Duration::from_secs(60);
@@ -1713,6 +1792,52 @@ mod tests {
             async move { handler.run(cancel).await }
         });
         cancel
+    }
+
+    const TOO_MANY: &str = "HTTP/1.1 429 \r\nContent-Length: 3\r\nConnection: close\r\n\r\nOK\n";
+
+    /// A result queued when the probe shuts down goes out in one last post
+    /// before `stopped` returns; with nothing running, `stopped` returns at
+    /// once.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_posts_what_is_queued_then_stops() {
+        let (transport, mut seen) = answering(&[OK]);
+        let (handler, _t0) = twin_handler(transport).await;
+        handler.stopped().await;
+
+        let cancel = start(&handler);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        handler.sink().submit(make_result(1001));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            seen.try_recv().is_err(),
+            "nothing posted before the shutdown"
+        );
+
+        cancel.cancel();
+        handler.stopped().await;
+        let (_, req) = seen.try_recv().expect("the shutdown's post");
+        assert!(req.contains("\"id\":\"1001\""), "{req}");
+        assert_eq!(handler.queue_stats().await.count, 0);
+        assert!(seen.try_recv().is_err(), "one post");
+    }
+
+    /// While a 429 holds posts, a shutdown sends none: it would be one
+    /// more refused request.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_under_a_429_hold_posts_nothing() {
+        let (transport, mut seen) = answering(&[TOO_MANY]);
+        let (handler, _t0) = twin_handler(transport).await;
+        let cancel = start(&handler);
+        handler.sink().submit(make_result(1001));
+        // Starla's own first post, a minute in, is refused
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert!(seen.try_recv().is_ok(), "the refused post");
+
+        cancel.cancel();
+        handler.stopped().await;
+        assert!(seen.try_recv().is_err(), "no post at shutdown");
+        assert_eq!(handler.queue_stats().await.count, 1, "kept, then lost");
     }
 
     /// The session's httppost CRONLINE, as enodia's controller sent it on
