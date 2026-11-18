@@ -9,12 +9,9 @@ repository.workspace = true
 readme = "README.md"
 
 [dependencies]
-starla-common = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 prometheus = { workspace = true, optional = true }
-metrics = { workspace = true, optional = true }
-metrics-exporter-prometheus = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 tracing = { workspace = true }
@@ -25,4 +22,4 @@ tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []
-export = ["prometheus", "metrics", "metrics-exporter-prometheus", "axum", "serde"]
+export = ["prometheus", "axum", "serde"]

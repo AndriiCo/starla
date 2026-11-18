@@ -19,16 +19,11 @@ hickory-resolver = { workspace = true }
 hickory-proto = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
-x509-parser = { workspace = true }
-chrono = { workspace = true }
-thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 rand = { workspace = true }
 socket2 = { workspace = true }
-pnet_packet = { workspace = true }
-webpki-roots = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
