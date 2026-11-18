@@ -81,15 +81,18 @@ pub struct StorageSettings {
     #[serde(default = "default_max_queue_size")]
     pub max_queue_size: usize,
 
-    #[serde(default = "default_retention_days")]
-    pub retention_days: u32,
+    /// No longer used (Starla keeps no results to expire): accepted so that
+    /// a config that sets it still loads, and reported by
+    /// [`ProbeConfig::ignored_keys`].
+    #[serde(default, skip_serializing)]
+    pub retention_days: Option<toml::Value>,
 }
 
 impl Default for StorageSettings {
     fn default() -> Self {
         Self {
             max_queue_size: default_max_queue_size(),
-            retention_days: default_retention_days(),
+            retention_days: None,
         }
     }
 }
@@ -140,23 +143,32 @@ pub struct LoggingSettings {
     #[serde(default = "default_log_format")]
     pub format: String,
 
-    #[serde(default = "default_log_output")]
-    pub output: String,
-
-    #[serde(default = "default_max_file_size_mb")]
-    pub max_file_size_mb: u64,
-
+    /// With `--log-dir`, how many daily log files to keep: at each start
+    /// and each rotation the oldest `probe.log.*` files beyond this many
+    /// are deleted. 0 keeps them all.
     #[serde(default = "default_max_files")]
     pub max_files: u32,
+
+    /// No longer used: the log goes to stdout, or to daily files in
+    /// `--log-dir` when that is given. Accepted so that a config that sets
+    /// it still loads, and reported by [`ProbeConfig::ignored_keys`].
+    #[serde(default, skip_serializing)]
+    pub output: Option<toml::Value>,
+
+    /// No longer used: log files rotate daily, not by size. Accepted so
+    /// that a config that sets it still loads, and reported by
+    /// [`ProbeConfig::ignored_keys`].
+    #[serde(default, skip_serializing)]
+    pub max_file_size_mb: Option<toml::Value>,
 }
 
 impl Default for LoggingSettings {
     fn default() -> Self {
         Self {
             format: default_log_format(),
-            output: default_log_output(),
-            max_file_size_mb: default_max_file_size_mb(),
             max_files: default_max_files(),
+            output: None,
+            max_file_size_mb: None,
         }
     }
 }
@@ -187,9 +199,6 @@ fn default_keepalive_interval() -> u64 {
 fn default_max_queue_size() -> usize {
     10000
 }
-fn default_retention_days() -> u32 {
-    30
-}
 fn default_metrics_enabled() -> bool {
     true
 }
@@ -198,12 +207,6 @@ fn default_metrics_listen_addr() -> String {
 }
 fn default_log_format() -> String {
     "json".to_string()
-}
-fn default_log_output() -> String {
-    "stdout".to_string()
-}
-fn default_max_file_size_mb() -> u64 {
-    10
 }
 fn default_max_files() -> u32 {
     5
@@ -219,6 +222,31 @@ impl ProbeConfig {
             .map_err(|e| crate::Error::Config(format!("Failed to parse config: {}", e)))?;
 
         Ok(config)
+    }
+
+    /// The keys this config sets that Starla no longer reads, each with
+    /// what to do instead, for a warning at startup.
+    pub fn ignored_keys(&self) -> Vec<(&'static str, &'static str)> {
+        let mut keys = Vec::new();
+        if self.logging.output.is_some() {
+            keys.push((
+                "logging.output",
+                "the log goes to stdout, or to daily files with --log-dir",
+            ));
+        }
+        if self.logging.max_file_size_mb.is_some() {
+            keys.push((
+                "logging.max_file_size_mb",
+                "log files rotate daily; logging.max_files caps how many are kept",
+            ));
+        }
+        if self.storage.retention_days.is_some() {
+            keys.push((
+                "storage.retention_days",
+                "Starla keeps no results on disk to expire",
+            ));
+        }
+        keys
     }
 
     /// Save configuration to TOML file
@@ -291,6 +319,40 @@ mod tests {
         assert!(example.contains("\nbackground_sched_idle = false\n"));
         assert!(!parsed.measurements.honor_ntp_kod);
         assert!(example.contains("\nhonor_ntp_kod = false\n"));
+        assert!(parsed.ignored_keys().is_empty());
+    }
+
+    /// A config written for an earlier Starla, with the keys it no longer
+    /// reads, still loads; each of those keys is reported, and the rest
+    /// of the config is read as before.
+    #[test]
+    fn a_config_with_keys_no_longer_read_loads_and_names_them() {
+        let old = "[storage]\nmax_queue_size = 500\nretention_days = 30\n[logging]\nformat = \
+                   \"text\"\noutput = \"file\"\nmax_file_size_mb = 10\nmax_files = 3\n";
+        let parsed: ProbeConfig = toml::from_str(old).unwrap();
+        assert_eq!(parsed.storage.max_queue_size, 500);
+        assert_eq!(parsed.logging.format, "text");
+        assert_eq!(parsed.logging.max_files, 3);
+        let ignored: Vec<_> = parsed.ignored_keys().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            ignored,
+            [
+                "logging.output",
+                "logging.max_file_size_mb",
+                "storage.retention_days"
+            ]
+        );
+
+        // Nothing to report for a config without them, or for the
+        // defaults; and they are not written back out.
+        let parsed: ProbeConfig = toml::from_str("[logging]\nformat = \"text\"\n").unwrap();
+        assert!(parsed.ignored_keys().is_empty());
+        assert_eq!(parsed.logging.max_files, 5);
+        assert!(ProbeConfig::default().ignored_keys().is_empty());
+        let written = toml::to_string(&ProbeConfig::default()).unwrap();
+        assert!(!written.contains("retention_days"), "{written}");
+        assert!(!written.contains("output"), "{written}");
+        assert!(!written.contains("max_file_size_mb"), "{written}");
     }
 
     #[test]

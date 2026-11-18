@@ -70,6 +70,10 @@ pub struct LogConfig {
 
     /// Whether to use JSON format
     pub json_format: bool,
+
+    /// With `log_dir`, how many daily files to keep; the oldest beyond
+    /// this are deleted at start and at each rotation. 0 keeps them all.
+    pub max_files: usize,
 }
 
 impl Default for LogConfig {
@@ -78,6 +82,7 @@ impl Default for LogConfig {
             log_dir: None,
             level: "info".to_string(),
             json_format: cfg!(feature = "json"),
+            max_files: crate::config::LoggingSettings::default().max_files as usize,
         }
     }
 }
@@ -300,6 +305,7 @@ fn drop_elsewhere<T: Send + 'static>(
 ///     log_dir: Some("/var/log/starla".into()),
 ///     level: "debug".to_string(),
 ///     json_format: false,
+///     max_files: 7,
 /// };
 /// let _log = init_logging(config).unwrap();
 /// ```
@@ -327,8 +333,13 @@ pub fn init_logging(config: LogConfig) -> anyhow::Result<LogGuard> {
         Some(dir) => {
             // Ensure log directory exists
             std::fs::create_dir_all(&dir)?;
-            // Create daily rolling file appender
-            let file_appender = tracing_appender::rolling::daily(dir, "probe.log");
+            // Daily files, probe.log.YYYY-MM-DD, as rolling::daily names
+            // them; only the newest max_files are kept.
+            let file_appender = tracing_appender::rolling::Builder::new()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix("probe.log")
+                .max_log_files(config.max_files)
+                .build(dir)?;
             let (writer, guard) = spawn_writer(file_appender, json);
             tracing_subscriber::registry()
                 .with(filter)
@@ -574,6 +585,7 @@ mod tests {
     const CHILD: &str = "STARLA_LOGGING_TEST_CHILD";
     /// The child's log directory, for the file tests.
     const CHILD_LOG_DIR: &str = "STARLA_LOGGING_TEST_LOG_DIR";
+    const CHILD_MAX_FILES: &str = "STARLA_LOGGING_TEST_MAX_FILES";
 
     #[test]
     fn test_default_config() {
@@ -1056,6 +1068,7 @@ mod tests {
             log_dir: None,
             level: "info".to_string(),
             json_format: false,
+            max_files: 0,
         })
         .expect("init logging");
         for i in 0..STDOUT_LINES {
@@ -1104,6 +1117,7 @@ mod tests {
             log_dir: None,
             level: "info".to_string(),
             json_format: false,
+            max_files: 0,
         })
         .expect("init logging");
         for i in 0..SIGTERM_LINES {
@@ -1152,6 +1166,7 @@ mod tests {
             log_dir: None,
             level: "info".to_string(),
             json_format: false,
+            max_files: 0,
         })
         .expect("init logging");
         log.shut_down_gracefully_on_sigterm(Duration::from_millis(500));
@@ -1199,10 +1214,14 @@ mod tests {
             return;
         }
         let dir = std::env::var_os(CHILD_LOG_DIR).expect("the child's log dir");
+        let max_files = std::env::var(CHILD_MAX_FILES)
+            .ok()
+            .map_or(0, |n| n.parse().expect("a number of files"));
         let _log = init_logging(LogConfig {
             log_dir: Some(dir.into()),
             level: "info".to_string(),
             json_format: false,
+            max_files,
         })
         .expect("init logging");
         for i in 0..FILE_LINES {
@@ -1244,5 +1263,49 @@ mod tests {
             );
         }
         assert!(!log.contains('\x1b'), "no escape codes in a log file");
+    }
+
+    /// `max_files` caps the daily files `--log-dir` keeps: at start the
+    /// oldest go, leaving room for today's. Other files are left alone.
+    #[test]
+    fn file_log_keeps_at_most_max_files() {
+        let dir = TempDir::new("max-files");
+        for day in 1..=6 {
+            std::fs::write(dir.0.join(format!("probe.log.2026-01-0{day}")), "old\n")
+                .expect("an old log file");
+        }
+        std::fs::write(dir.0.join("notes.txt"), "kept\n").expect("another file");
+        let out = run_child(
+            "child_file_log",
+            &[
+                (CHILD_LOG_DIR, dir.0.as_os_str()),
+                (CHILD_MAX_FILES, std::ffi::OsStr::new("3")),
+            ],
+            false,
+        );
+        assert!(
+            out.status.success(),
+            "child failed: {}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let logs: Vec<String> = std::fs::read_dir(&dir.0)
+            .expect("read the log dir")
+            .map(|e| {
+                e.expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|n| n.starts_with("probe.log"))
+            .collect();
+        assert_eq!(logs.len(), 3, "{logs:?}");
+        let today = logs
+            .iter()
+            .map(|n| std::fs::read_to_string(dir.0.join(n)).expect("read a log"))
+            .any(|log| log.contains("file line 0 of"));
+        assert!(today, "today's log is one of the three: {logs:?}");
+        assert!(dir.0.join("notes.txt").exists());
     }
 }

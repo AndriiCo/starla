@@ -38,7 +38,6 @@ cask "starla" do
 
         [storage]
         max_queue_size = 10000
-        retention_days = 30
       TOML
     end
 

@@ -13,19 +13,39 @@ let
       ssh_timeout = cfg.controller.sshTimeout;
       keepalive_interval = cfg.controller.keepaliveInterval;
     };
-    storage = {
-      max_queue_size = cfg.storage.maxQueueSize;
-      retention_days = cfg.storage.retentionDays;
-    };
+    storage.max_queue_size = cfg.storage.maxQueueSize;
     metrics = {
       enabled = cfg.metrics.enable;
       listen_addr = cfg.metrics.listenAddr;
     };
-    logging = {
-      format = cfg.logging.format;
-      output = cfg.logging.output;
-      max_file_size_mb = cfg.logging.maxFileSizeMB;
-      max_files = cfg.logging.maxFiles;
+    logging.format = cfg.logging.format;
+  };
+
+  # Options that never did anything. Still accepted, so that a configuration
+  # setting one evaluates, but with a warning, and not written to config.toml.
+  ignoredOption = lib.mkOption {
+    type = lib.types.nullOr lib.types.anything;
+    default = null;
+    visible = false;
+    description = "Ignored: Starla never read it. Setting it only warns.";
+  };
+
+  ignored = lib.filterAttrs (_: o: o.value != null) {
+    "storage.retentionDays" = {
+      value = cfg.storage.retentionDays;
+      why = "Starla keeps no results on disk to expire";
+    };
+    "logging.output" = {
+      value = cfg.logging.output;
+      why = "the service logs to stdout, which systemd sends to the journal";
+    };
+    "logging.maxFileSizeMB" = {
+      value = cfg.logging.maxFileSizeMB;
+      why = "the service writes no log files; the journal has its own limits";
+    };
+    "logging.maxFiles" = {
+      value = cfg.logging.maxFiles;
+      why = "the service writes no log files; the journal has its own limits";
     };
   };
 in
@@ -97,12 +117,7 @@ in
         description = "Maximum number of results to hold in the upload queue.";
       };
 
-      retentionDays = lib.mkOption {
-        type = lib.types.ints.positive;
-        default = 30;
-        description = "Result retention period in days.";
-      };
-
+      retentionDays = ignoredOption;
     };
 
     metrics = {
@@ -126,27 +141,17 @@ in
         description = "Log output format.";
       };
 
-      output = lib.mkOption {
-        type = lib.types.enum [ "stdout" "file" "syslog" ];
-        default = "stdout";
-        description = "Log output destination.";
-      };
-
-      maxFileSizeMB = lib.mkOption {
-        type = lib.types.ints.positive;
-        default = 10;
-        description = "Maximum log file size in MB (when output=file).";
-      };
-
-      maxFiles = lib.mkOption {
-        type = lib.types.ints.positive;
-        default = 5;
-        description = "Maximum number of rotated log files.";
-      };
+      output = ignoredOption;
+      maxFileSizeMB = ignoredOption;
+      maxFiles = ignoredOption;
     };
   };
 
   config = lib.mkIf cfg.enable {
+    warnings = lib.mapAttrsToList
+      (name: o: "services.starla.${name} does nothing and is ignored: ${o.why}.")
+      ignored;
+
     systemd.services.starla = {
       description = "Starla RIPE Atlas Software Probe";
       wantedBy = [ "multi-user.target" ];

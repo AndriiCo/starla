@@ -308,6 +308,7 @@ fn main() -> Result<()> {
         // JSON needs both: the feature compiled in, and a config that has
         // not asked for text.
         json_format: cfg!(feature = "structured-logging") && config.logging.format != "text",
+        max_files: config.logging.max_files as usize,
     };
 
     // Held to the end of main: the log is written only while it lives.
@@ -321,6 +322,14 @@ fn main() -> Result<()> {
         starla_common::VERSION,
         starla_common::FIRMWARE_VERSION
     );
+    for (key, instead) in config.ignored_keys() {
+        warn!(
+            "{}: {} is no longer used and is ignored: {}",
+            config_path.display(),
+            key,
+            instead
+        );
+    }
     // Before any measurement runs; off unless the config asks.
     starla_network::rxstamp::set_enabled(config.measurements.kernel_rx_timestamps);
     starla_measurements::ntp::kod::set_enabled(config.measurements.honor_ntp_kod);

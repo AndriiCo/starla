@@ -28,6 +28,7 @@ let log_config = LogConfig {
     log_dir: Some("/var/log/starla".into()),
     level: "debug".to_string(),
     json_format: false,
+    max_files: 7, // daily files kept in log_dir; 0 keeps them all
 };
 let _log = init_logging(log_config)?;
 

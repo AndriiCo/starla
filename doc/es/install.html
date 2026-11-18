@@ -141,16 +141,14 @@
           <tr><td><code>controller.sshTimeout</code></td><td><code>30</code></td><td>SSH connection timeout (s)</td></tr>
           <tr><td><code>controller.keepaliveInterval</code></td><td><code>60</code></td><td>SSH keepalive interval (s)</td></tr>
           <tr><td><code>storage.maxQueueSize</code></td><td><code>10000</code></td><td>Max results in upload queue</td></tr>
-          <tr><td><code>storage.retentionDays</code></td><td><code>30</code></td><td>Result retention period</td></tr>
           <tr><td><code>metrics.enable</code></td><td><code>true</code></td><td>Prometheus metrics export</td></tr>
           <tr><td><code>metrics.listenAddr</code></td><td><code>"127.0.0.1:9695"</code></td><td>Metrics listen address</td></tr>
           <tr><td><code>logging.format</code></td><td><code>"json"</code></td><td>json · text</td></tr>
-          <tr><td><code>logging.output</code></td><td><code>"stdout"</code></td><td>stdout · file · syslog</td></tr>
         </tbody>
       </table>
 
       <h3>Example with options</h3>
-      <pre><div class="pre-head"><span class="lang">nix</span><span>configuration.nix</span></div><div class="pre-body"><code>services.starla = { enable = <span class="k">true</span>; logLevel = <span class="s">"debug"</span>; metrics.listenAddr = <span class="s">"0.0.0.0:9695"</span>; storage.retentionDays = <span class="n">7</span>; };</code></div></pre>
+      <pre><div class="pre-head"><span class="lang">nix</span><span>configuration.nix</span></div><div class="pre-body"><code>services.starla = { enable = <span class="k">true</span>; logLevel = <span class="s">"debug"</span>; metrics.listenAddr = <span class="s">"0.0.0.0:9695"</span>; storage.maxQueueSize = <span class="n">5000</span>; };</code></div></pre>
 
       <h3>Secret-managed SSH key</h3>
       <p>For agenix, sops-nix, or similar, point <code>sshKeyFile</code> at the decrypted key. The key is loaded via systemd's <code>LoadCredential</code>.</p>

@@ -83,9 +83,6 @@ honor_ntp_kod = false
 # Maximum number of results to hold in the upload queue
 max_queue_size = 10000
 
-# Result retention period in days
-retention_days = 30
-
 [metrics]
 # Enable Prometheus metrics export (requires metrics-export feature)
 enabled = true
@@ -97,9 +94,12 @@ listen_addr = "127.0.0.1:9695"
 # Log format: json or text
 format = "json"
 
-# Not yet wired up: file output and rotation are driven by the --log-dir
-# flag, and these three keys are read but ignored. Tracked separately from
-# `format` and `[probe] log_level`, which do take effect.
-output = "stdout"
-max_file_size_mb = 10
+# With --log-dir, the log goes to daily files there (probe.log.YYYY-MM-DD)
+# instead of stdout, and only the newest max_files of them are kept: at
+# start and at each rotation the older probe.log.* files are deleted.
+# 0 keeps them all.
+#
+# output, max_file_size_mb and [storage] retention_days, which earlier
+# versions listed here, never did anything; a config that still sets them
+# loads, with a warning naming each one.
 max_files = 5

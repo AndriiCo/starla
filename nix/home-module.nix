@@ -15,10 +15,16 @@ let
       ssh_timeout = cfg.controller.sshTimeout;
       keepalive_interval = cfg.controller.keepaliveInterval;
     };
-    storage = {
-      max_queue_size = cfg.storage.maxQueueSize;
-      retention_days = cfg.storage.retentionDays;
-    };
+    storage.max_queue_size = cfg.storage.maxQueueSize;
+  };
+
+  # Options that never did anything. Still accepted, so that a configuration
+  # setting one evaluates, but with a warning, and not written to config.toml.
+  ignoredOption = lib.mkOption {
+    type = lib.types.nullOr lib.types.anything;
+    default = null;
+    visible = false;
+    description = "Ignored: Starla never read it. Setting it only warns.";
   };
 in
 {
@@ -77,11 +83,7 @@ in
         description = "Maximum number of results in the upload queue.";
       };
 
-      retentionDays = lib.mkOption {
-        type = lib.types.ints.positive;
-        default = 30;
-        description = "Result retention period in days.";
-      };
+      retentionDays = ignoredOption;
     };
 
     tray = {
@@ -101,6 +103,9 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    warnings = lib.optional (cfg.storage.retentionDays != null)
+      "services.starla.storage.retentionDays does nothing and is ignored: Starla keeps no results on disk to expire.";
+
     # Config file
     xdg.configFile."starla/config.toml".source = configFile;
 
