@@ -351,15 +351,19 @@ fn main() -> Result<()> {
         );
         return Err(e.into());
     }
-    let runtime_dir = starla_common::runtime_dir();
-    if let Err(e) = std::fs::create_dir_all(&runtime_dir) {
-        error!(
-            "Failed to create runtime directory {}: {}",
-            runtime_dir.display(),
-            e
-        );
-        return Err(e.into());
-    }
+    // In the /tmp/starla-<uid> fallback this also checks that the
+    // directory is ours alone, since the status socket goes in it.
+    let runtime_dir = match starla_common::ensure_runtime_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            error!(
+                "Failed to create runtime directory {}: {}",
+                starla_common::runtime_dir().display(),
+                e
+            );
+            return Err(e.into());
+        }
+    };
     debug!("Runtime directory: {}", runtime_dir.display());
 
     // Probe ID is received from the registration server during INIT

@@ -20,9 +20,10 @@ pub mod types;
 pub use config::*;
 pub use error::*;
 pub use paths::{
-    config_dir, config_file, ensure_config_dir, ensure_state_dir, known_hosts_path,
-    paused_until_path, probe_id_path, probe_key_path, probe_pubkey_path, read_probe_id,
-    runtime_dir, set_runtime_dir, set_state_dir, state_dir, status_socket_path, write_probe_id,
+    config_dir, config_file, ensure_config_dir, ensure_runtime_dir, ensure_state_dir,
+    known_hosts_path, paused_until_path, probe_id_path, probe_key_path, probe_pubkey_path,
+    read_probe_id, runtime_dir, set_runtime_dir, set_state_dir, state_dir, status_socket_path,
+    trusted_status_socket_path, write_probe_id,
 };
 pub use pause::{read_pause_state, write_pause_state, PauseState};
 pub use traceroute::{TracerouteOptions, TracerouteProtocol};

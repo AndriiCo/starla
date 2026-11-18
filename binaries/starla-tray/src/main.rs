@@ -62,7 +62,8 @@ fn read_status() -> Option<ProbeStatus> {
         use std::io::Read;
         use std::os::unix::net::UnixStream;
 
-        let socket_path = starla_common::status_socket_path();
+        // Not a socket in a /tmp/starla-<uid> that another user made.
+        let socket_path = starla_common::trusted_status_socket_path().ok()?;
         let mut stream = UnixStream::connect(&socket_path).ok()?;
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
 

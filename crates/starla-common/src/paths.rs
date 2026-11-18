@@ -21,6 +21,8 @@
 //! 3. `$XDG_RUNTIME_DIR/starla`
 //! 4. Root: `/run/starla`, non-root: `/tmp/starla-<uid>`
 
+#[cfg(unix)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -134,25 +136,34 @@ pub fn state_dir() -> PathBuf {
 /// 3. Container: `/run/starla`
 /// 4. `$XDG_RUNTIME_DIR/starla`
 /// 5. Root: `/run/starla`, non-root: `/tmp/starla-<uid>`
+///
+/// The last one sits in a directory every user can write to, so it is
+/// trusted only once [`ensure_runtime_dir`] has checked it.
 pub fn runtime_dir() -> PathBuf {
+    resolve_runtime_dir().0
+}
+
+/// The runtime directory, and whether it is the fallback in the shared
+/// temporary directory (where another user may have created it first).
+fn resolve_runtime_dir() -> (PathBuf, bool) {
     if let Some(override_dir) = RUNTIME_DIR_OVERRIDE.get() {
-        return override_dir.clone();
+        return (override_dir.clone(), false);
     }
 
     if let Ok(dir) = std::env::var("RUNTIME_DIRECTORY") {
-        return PathBuf::from(dir);
+        return (PathBuf::from(dir), false);
     }
 
     if is_container() {
-        return PathBuf::from("/run").join(APP_NAME);
+        return (PathBuf::from("/run").join(APP_NAME), false);
     }
 
     if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(xdg_runtime).join(APP_NAME);
+        return (PathBuf::from(xdg_runtime).join(APP_NAME), false);
     }
 
     if is_root() {
-        return PathBuf::from("/run").join(APP_NAME);
+        return (PathBuf::from("/run").join(APP_NAME), false);
     }
 
     // Per-user temp directory
@@ -166,7 +177,121 @@ pub fn runtime_dir() -> PathBuf {
             0u32
         }
     };
-    std::env::temp_dir().join(format!("{}-{}", APP_NAME, uid))
+    (
+        std::env::temp_dir().join(format!("{}-{}", APP_NAME, uid)),
+        true,
+    )
+}
+
+/// Create the runtime directory if it is missing, and return it.
+///
+/// For the `/tmp/starla-<uid>` fallback, the directory is created 0700 and
+/// must then be a real directory (not a symlink) owned by this user; a mode
+/// other than 0700 is corrected. One that another user created first is an
+/// error: whoever owns it could replace the status socket in it, and the
+/// tray would show their status, public key included.
+pub fn ensure_runtime_dir() -> std::io::Result<PathBuf> {
+    let (dir, shared_tmp) = resolve_runtime_dir();
+    #[cfg(unix)]
+    if shared_tmp {
+        ensure_private_dir(&dir, unsafe { libc::geteuid() })?;
+        return Ok(dir);
+    }
+    #[cfg(not(unix))]
+    let _ = shared_tmp;
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// The status socket path, for a client (the tray) to connect to.
+///
+/// In the `/tmp/starla-<uid>` fallback the directory must be a real one
+/// owned by this user that no one else can write to; otherwise this is an
+/// error rather than a path to a socket someone else may have put there.
+/// Nothing is created or changed.
+pub fn trusted_status_socket_path() -> std::io::Result<PathBuf> {
+    let (dir, shared_tmp) = resolve_runtime_dir();
+    #[cfg(unix)]
+    if shared_tmp {
+        check_private_dir(&dir, unsafe { libc::geteuid() })?;
+    }
+    #[cfg(not(unix))]
+    let _ = shared_tmp;
+    Ok(dir.join("starla.sock"))
+}
+
+/// Open `dir` without following a symlink, and require a directory owned
+/// by `uid`.
+#[cfg(unix)]
+fn open_owned_dir(dir: &Path, uid: u32) -> std::io::Result<(std::fs::File, u32)> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    // O_NOFOLLOW: a symlink in the last component fails (ELOOP) instead of
+    // being followed; fstat and fchmod then act on what was opened, which
+    // cannot be swapped for something else in between.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)
+        .map_err(|e| {
+            Error::new(
+                e.kind(),
+                format!("{}: not a directory of our own: {}", dir.display(), e),
+            )
+        })?;
+    let meta = file.metadata()?;
+    if !meta.is_dir() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("{}: not a directory", dir.display()),
+        ));
+    }
+    if meta.uid() != uid {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "{} is owned by uid {}, not by uid {}; remove it or set XDG_RUNTIME_DIR or \
+                 --runtime-dir",
+                dir.display(),
+                meta.uid(),
+                uid
+            ),
+        ));
+    }
+    Ok((file, meta.mode() & 0o7777))
+}
+
+/// Create `dir` 0700 if it is missing, then require it to be a real
+/// directory owned by `uid`, and set its mode to 0700 if it is not.
+#[cfg(unix)]
+fn ensure_private_dir(dir: &Path, uid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let (file, mode) = open_owned_dir(dir, uid)?;
+    if mode != 0o700 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Require `dir` to be a real directory owned by `uid` that no other user
+/// can write to. Changes nothing.
+#[cfg(unix)]
+fn check_private_dir(dir: &Path, uid: u32) -> std::io::Result<()> {
+    let (_, mode) = open_owned_dir(dir, uid)?;
+    if mode & 0o022 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is writable by others (mode {:o})", dir.display(), mode),
+        ));
+    }
+    Ok(())
 }
 
 /// Get the default config file path
@@ -370,6 +495,90 @@ mod tests {
 
         let kh = known_hosts_path();
         assert!(kh.to_string_lossy().contains("known_hosts"));
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    #[cfg(unix)]
+    fn our_uid() -> u32 {
+        unsafe { libc::geteuid() }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_private_dir_is_created_0700() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("starla-1000");
+        ensure_private_dir(&dir, our_uid()).unwrap();
+        assert!(dir.is_dir());
+        assert_eq!(mode_of(&dir), 0o700);
+        // Once it is there, it passes as it is, and the tray accepts it.
+        ensure_private_dir(&dir, our_uid()).unwrap();
+        check_private_dir(&dir, our_uid()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn our_own_dir_with_a_looser_mode_is_set_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("starla-1000");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        // The tray will not use a directory others can write to.
+        assert!(check_private_dir(&dir, our_uid()).is_err());
+        ensure_private_dir(&dir, our_uid()).unwrap();
+        assert_eq!(mode_of(&dir), 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dir_someone_else_owns_is_refused_and_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("starla-1000");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        // Owned by us, so as far as "uid + 1" is concerned someone else
+        // created it first.
+        let other = our_uid().wrapping_add(1);
+        let err = ensure_private_dir(&dir, other).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(check_private_dir(&dir, other).is_err());
+        assert_eq!(mode_of(&dir), 0o777);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_refused_and_its_target_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = tmp.path().join("starla-1000");
+        std::os::unix::fs::symlink(&target, &dir).unwrap();
+        assert!(ensure_private_dir(&dir, our_uid()).is_err());
+        assert!(check_private_dir(&dir, our_uid()).is_err());
+        assert_eq!(mode_of(&target), 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_in_place_of_the_dir_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("starla-1000");
+        std::fs::write(&dir, b"").unwrap();
+        assert!(ensure_private_dir(&dir, our_uid()).is_err());
+        assert!(check_private_dir(&dir, our_uid()).is_err());
     }
 
     #[test]
