@@ -69,9 +69,12 @@ in
       default = null;
       description = ''
         Path to a file containing the SSH private key (OpenSSH PEM format).
-        When set, starla reads the key from this file via the STARLA_SSH_KEY
-        environment variable instead of generating one in the state directory.
-        Use this to inject keys from secret managers like agenix or sops-nix.
+        When set, systemd passes the file to the service as the credential
+        `ssh-key` (LoadCredential=), and starla reads it from
+        $CREDENTIALS_DIRECTORY/ssh-key instead of using or generating the key
+        in the state directory. The file need not be readable by the
+        service's dynamic user: systemd reads it as root. Use this to inject
+        keys from secret managers like agenix or sops-nix.
       '';
     };
 
@@ -84,7 +87,17 @@ in
     statusSocket = lib.mkOption {
       type = lib.types.bool;
       default = false;
-      description = "Enable the Unix domain socket for tray app communication. Only needed on desktop systems.";
+      description = ''
+        Enable starla's Unix domain status socket (for the tray app). In
+        this system service it is /run/starla/starla.sock, in a 0750
+        directory of the service's dynamic user, so no desktop user can
+        connect to it; and the tray looks for the socket in its own
+        $XDG_RUNTIME_DIR/starla, not there. The tray's pause does not reach
+        the service either: the tray writes paused_until to its user's state
+        directory, and the service reads only its own (/var/lib/starla). The
+        tray works with a starla run as the desktop user, not with this
+        service.
+      '';
     };
 
     controller = {
