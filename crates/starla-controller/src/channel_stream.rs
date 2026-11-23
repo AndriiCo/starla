@@ -24,14 +24,16 @@ const CLOSE_GRACE: Duration = Duration::from_secs(30);
 ///
 /// The channel ends as OpenSSH's ssh ends a forwarded connection (nchan.c):
 /// one EOF each way, then one CLOSE. When the server's EOF comes first, the
-/// app's stream ends, and the bridge sends its EOF and CLOSE. When the app
-/// closes its side first (shuts down its writing half, or drops the stream),
-/// the bridge sends its EOF and goes on passing the server's data to the app
-/// until the server's EOF, then sends CLOSE: at most [`CLOSE_GRACE`] later,
-/// or at once if the server has more to say and the app is gone. Each is
-/// sent once: Starla sent EOF twice and left CLOSE to russh's answer to the
-/// server's. Once the server's CLOSE has come, russh has answered it, and
-/// the bridge sends nothing more.
+/// app reads the end of its stream, as ssh -R shuts down the writing half of
+/// the connection it forwards to (shutdown(SHUT_WR)), and the bridge goes on
+/// passing the app's data to the server until the app closes its side, then
+/// sends its EOF and CLOSE. When the app closes its side first (shuts down
+/// its writing half, or drops the stream), the bridge sends its EOF and goes
+/// on passing the server's data to the app until the server's EOF, then
+/// sends CLOSE: at most [`CLOSE_GRACE`] later, or at once if the server has
+/// more to say and the app is gone. Each is sent once: Starla sent EOF twice
+/// and left CLOSE to russh's answer to the server's. Once the server's CLOSE
+/// has come, russh has answered it, and the bridge sends nothing more.
 pub fn channel_to_stream(mut channel: Channel<Msg>) -> DuplexStream {
     let (app_side, bridge_side) = tokio::io::duplex(64 * 1024);
     let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge_side);
@@ -41,6 +43,8 @@ pub fn channel_to_stream(mut channel: Channel<Msg>) -> DuplexStream {
         // Set when the app has closed its side and our EOF has gone: the
         // server has until then to close its side
         let mut closing_by: Option<Instant> = None;
+        // Set when the server's EOF has come and the app's stream has ended
+        let mut peer_eof = false;
 
         loop {
             tokio::select! {
@@ -49,6 +53,11 @@ pub fn channel_to_stream(mut channel: Channel<Msg>) -> DuplexStream {
                 // SSH channel -> app
                 msg = channel.wait() => {
                     match msg {
+                        Some(ChannelMsg::Data { .. }) if peer_eof => {
+                            // Data after the server's EOF breaks RFC 4254
+                            // 5.3, and the app's stream has ended
+                            trace!("SSH channel: data after EOF dropped");
+                        }
                         Some(ChannelMsg::Data { data }) => {
                             trace!("SSH channel -> stream: {} bytes", data.len());
                             if bridge_write.write_all(&data).await.is_err() {
@@ -56,6 +65,13 @@ pub fn channel_to_stream(mut channel: Channel<Msg>) -> DuplexStream {
                                 break;
                             }
                             let _ = bridge_write.flush().await;
+                        }
+                        Some(ChannelMsg::Eof) if closing_by.is_none() => {
+                            // A half-close: the app reads the end of its
+                            // stream and may still reply
+                            debug!("SSH channel EOF from the server");
+                            let _ = bridge_write.shutdown().await;
+                            peer_eof = true;
                         }
                         Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
                             debug!("SSH channel closed");
@@ -73,6 +89,10 @@ pub fn channel_to_stream(mut channel: Channel<Msg>) -> DuplexStream {
                             debug!("Stream closed by app");
                             let _ = channel.eof().await;
                             closing_by = Some(Instant::now() + CLOSE_GRACE);
+                            if peer_eof {
+                                // Both sides have ended: CLOSE at once
+                                break;
+                            }
                         }
                         Ok(n) => {
                             trace!("Stream -> SSH channel: {} bytes", n);
@@ -119,6 +139,12 @@ mod tests {
     /// What the server received on the channel from the probe, in order
     type Seen = Arc<Mutex<Vec<&'static str>>>;
 
+    /// The bytes of the probe's data on the channel
+    type Received = Arc<Mutex<Vec<u8>>>;
+
+    /// What a controller sends on a telnet channel for a one-off
+    const ONEOFF: &[u8] = b"ONEOFF 1\n\n";
+
     /// How the server answers the probe's EOF
     #[derive(Clone, Copy)]
     enum Answer {
@@ -137,9 +163,13 @@ mod tests {
     /// 0.62.5 (GHSA-m65r-rprj-r5rg) its server drops whatever comes for a
     /// channel after its own CLOSE, so a probe's CLOSE that answers the
     /// server's never reaches the handler. An exec gets "pong" and the
-    /// server's EOF and CLOSE at once.
+    /// server's EOF and CLOSE at once; an exec of "HALF" gets [`ONEOFF`] and
+    /// the server's EOF alone, as from an ssh -R whose forwarded connection
+    /// has shut down its writing half. Each data the probe sends shows as
+    /// "data" (once for a run of them) and its bytes go to `received`.
     struct Far {
         seen: Seen,
+        received: Received,
         answer: Answer,
         channels: Vec<Channel<russh::server::Msg>>,
     }
@@ -169,13 +199,32 @@ mod tests {
         async fn exec_request(
             &mut self,
             channel: ChannelId,
-            _: &[u8],
+            command: &[u8],
             session: &mut Session,
         ) -> Result<(), Self::Error> {
             session.channel_success(channel)?;
+            if command == b"HALF" {
+                session.data(channel, ONEOFF.to_vec())?;
+                session.eof(channel)?;
+                return Ok(());
+            }
             session.data(channel, b"pong\n".to_vec())?;
             session.eof(channel)?;
             session.close(channel)?;
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            _: ChannelId,
+            data: &[u8],
+            _: &mut Session,
+        ) -> Result<(), Self::Error> {
+            let mut seen = self.seen.lock().unwrap();
+            if seen.last() != Some(&"data") {
+                seen.push("data");
+            }
+            self.received.lock().unwrap().extend_from_slice(data);
             Ok(())
         }
 
@@ -227,8 +276,17 @@ mod tests {
     /// sees the probe send on it, and the session's handle (dropping it
     /// ends the session).
     async fn channel_to(answer: Answer) -> (Channel<Msg>, Seen, russh::client::Handle<Near>) {
+        let (channel, seen, _, handle) = channel_with_data_to(answer).await;
+        (channel, seen, handle)
+    }
+
+    /// [`channel_to`], and the bytes the server receives on the channel
+    async fn channel_with_data_to(
+        answer: Answer,
+    ) -> (Channel<Msg>, Seen, Received, russh::client::Handle<Near>) {
         let (near, far) = tokio::io::duplex(1 << 16);
         let seen = Seen::default();
+        let received = Received::default();
         let server = russh::server::Config {
             keys: vec![crate::generate_key().unwrap()],
             inactivity_timeout: None,
@@ -239,6 +297,7 @@ mod tests {
         };
         let handler = Far {
             seen: seen.clone(),
+            received: received.clone(),
             answer,
             channels: Vec::new(),
         };
@@ -261,7 +320,7 @@ mod tests {
             .unwrap();
         assert!(auth.success());
         let channel = handle.channel_open_session().await.unwrap();
-        (channel, seen, handle)
+        (channel, seen, received, handle)
     }
 
     /// What the server has seen once the probe's CLOSE has come, and a
@@ -326,14 +385,15 @@ mod tests {
     #[tokio::test]
     async fn an_app_that_shuts_down_its_side_still_reads_the_reply() {
         // A request and its end, then the server's reply after our EOF
-        let (channel, seen, _handle) = channel_to(Answer::Eof(b"reply")).await;
+        let (channel, seen, received, _handle) = channel_with_data_to(Answer::Eof(b"reply")).await;
         let mut stream = channel_to_stream(channel);
         stream.write_all(b"request").await.unwrap();
         stream.shutdown().await.unwrap();
         let mut reply = Vec::new();
         stream.read_to_end(&mut reply).await.unwrap();
         assert_eq!(reply, b"reply");
-        assert_eq!(closed(&seen).await, ["eof", "close"]);
+        assert_eq!(closed(&seen).await, ["data", "eof", "close"]);
+        assert_eq!(*received.lock().unwrap(), b"request");
     }
 
     #[tokio::test(start_paused = true)]
@@ -364,6 +424,49 @@ mod tests {
             seen.iter().filter(|s| **s == "eof").count() <= 1,
             "{seen:?}"
         );
+        still_up(&handle).await;
+    }
+
+    #[tokio::test]
+    async fn an_app_replies_after_the_servers_eof() {
+        // A controller behind ssh -R that has shut down its writing half:
+        // the one-off and EOF, no CLOSE. Starla took the EOF for a CLOSE,
+        // closed the channel and lost telnet's reply.
+        let (channel, seen, received, handle) = channel_with_data_to(Answer::Never).await;
+        channel.exec(true, "HALF").await.unwrap();
+        let mut stream = channel_to_stream(channel);
+        let mut request = Vec::new();
+        stream.read_to_end(&mut request).await.unwrap();
+        assert_eq!(request, ONEOFF);
+        stream.write_all(b"OK\r\n\r\n").await.unwrap();
+        stream.shutdown().await.unwrap();
+        assert_eq!(closed(&seen).await, ["data", "eof", "close"]);
+        assert_eq!(*received.lock().unwrap(), b"OK\r\n\r\n");
+        still_up(&handle).await;
+    }
+
+    #[tokio::test]
+    async fn the_channel_stays_open_after_the_servers_eof_until_the_app_closes() {
+        // The reply in two parts, a while after the EOF, from an app that
+        // then drops its stream without shutting it down
+        let (channel, seen, received, handle) = channel_with_data_to(Answer::Never).await;
+        channel.exec(true, "HALF").await.unwrap();
+        let mut stream = channel_to_stream(channel);
+        let mut request = Vec::new();
+        stream.read_to_end(&mut request).await.unwrap();
+        assert_eq!(request, ONEOFF);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+        stream.write_all(b"OK\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        stream.write_all(b"\r\n").await.unwrap();
+        drop(stream);
+        assert_eq!(closed(&seen).await, ["data", "eof", "close"]);
+        assert_eq!(*received.lock().unwrap(), b"OK\r\n\r\n");
         still_up(&handle).await;
     }
 }
