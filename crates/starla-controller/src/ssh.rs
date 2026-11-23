@@ -138,7 +138,10 @@ pub enum InitResponse {
     /// Server tells us to wait and retry after timeout seconds
     Wait { timeout_secs: u32 },
     /// `REFUSED` (the line after it is the reason): the reference probe waits
-    /// and then registers again (atlasinit writes force_reg.sh).
+    /// ATLAS_DEFAULT_WAIT and sends INIT again to the same controller, with no
+    /// registration. atlasinit's force_reg.sh branch for it never runs: the
+    /// line's '\n' is cut before `strncmp(line, "REFUSED\n", 8)` (atlasinit.c
+    /// 251-257, 402), so the reply takes the error branch.
     Refused { reason: String },
 }
 
