@@ -1301,14 +1301,16 @@ impl SshConnection {
         Ok(())
     }
 
-    /// Cancel reverse port forwarding
+    /// Cancel reverse port forwarding. RFC 4254 7.1 has the cancel name the
+    /// address and port of the request it cancels: "localhost", as
+    /// [`Self::request_reverse_tunnel`] asks.
     pub async fn cancel_reverse_tunnel(&self, bind_port: u16) -> anyhow::Result<()> {
         debug!("Cancelling reverse tunnel on port {}", bind_port);
 
         let session = self.session.lock().await;
         self.forwards.lock().unwrap().remove(&u32::from(bind_port));
         session
-            .cancel_tcpip_forward("127.0.0.1", bind_port as u32)
+            .cancel_tcpip_forward("localhost", u32::from(bind_port))
             .await?;
 
         Ok(())
