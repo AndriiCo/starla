@@ -441,25 +441,49 @@ async fn attempt(
             }
         }
     };
-    let stop = match tokio::time::timeout_at(deadline, read).await {
-        Ok(Ok(stop)) => stop,
-        Ok(Err(e)) => {
-            out.err = Some(format!("error reading response: {e}"));
-            return true;
+    let ended = match tokio::time::timeout_at(deadline, read).await {
+        // err_reading's unhandled cases report nothing: the timer does,
+        // when it fires (httpget.c:1928-1969)
+        Ok(Ended::Closed) if !reader.reports_close() => {
+            tokio::time::sleep_until(deadline).await;
+            None
         }
-        Err(_) => {
-            let (err, header) = reader.timed_out(&raw, opts.store_headers);
-            out.err = Some(err);
-            out.header = header;
-            return true;
-        }
+        Ok(ended) => Some(ended),
+        Err(_) => None,
+    };
+    let Some(ended) = ended else {
+        let (err, header) = reader.timed_out(&raw, opts.store_headers);
+        out.err = Some(err);
+        out.header = header;
+        return true;
     };
     out.rt = start.elapsed().as_secs_f64() * 1000.0;
 
-    let parsed = match stop {
-        None => parse_response(&raw, opts.store_headers),
-        Some(Stop::End(n)) => parse_response(&raw[..n], opts.store_headers),
-        Some(Stop::Cut(cut)) => {
+    let parsed = match ended {
+        Ended::Full => parse_response(&raw, opts.store_headers),
+        // err_reading (httpget.c:1928-1969), in the states it handles
+        Ended::Closed => match reader.state {
+            ReadState::Status => Err("error reading status".to_string()),
+            ReadState::Header => {
+                out.header = header_so_far(&raw[..reader.parsed], opts.store_headers);
+                Err("error reading headers".to_string())
+            }
+            // a body without a Content-Length ends with the connection
+            _ if reader.content_length.is_none() => {
+                parse_response(&raw[..reader.header_end], opts.store_headers).map(|p| {
+                    ParsedResponse {
+                        bsize: reader.body,
+                        ..p
+                    }
+                })
+            }
+            _ => {
+                out.header = reader.header(&raw, opts.store_headers);
+                Err("error reading body".to_string())
+            }
+        },
+        Ended::Stop(Stop::End(n)) => parse_response(&raw[..n], opts.store_headers),
+        Ended::Stop(Stop::Cut(cut)) => {
             out.read_truncated = true;
             match cut {
                 // err_status and err_header (httpget.c:1168-1188,
@@ -525,6 +549,14 @@ enum Conn {
 /// reached. So a server that ignores `Connection: close` does not make the
 /// timer discard a complete response. A read it did not get to take from
 /// is not logged, as get_input logs none (httpget.c:1063-1075).
+///
+/// A connection closed or failed before then is [`Ended::Closed`], an end
+/// of file and a reset alike, as eventcb takes either while reading for a
+/// TU_READ_ERR (tcputil.c:513-538): a TLS server's close with no
+/// close_notify too, which rustls calls an error and the openssl
+/// bufferevent an end of file. A request that cannot be written is no
+/// event eventcb handles (:572-573), so the reading goes on, and finds the
+/// connection's end.
 async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     request: &[u8],
@@ -532,8 +564,8 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     start: Instant,
     buf: &mut Vec<u8>,
     reads: &mut Vec<(usize, f64)>,
-) -> std::io::Result<Option<Stop>> {
-    stream.write_all(request).await?;
+) -> Ended {
+    let _ = stream.write_all(request).await;
     let mut chunk = [0u8; 8192];
     let size = if reader.limit.is_some() {
         SOCKET_READ
@@ -542,15 +574,11 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     };
     loop {
         let n = match stream.read(&mut chunk[..size]).await {
+            Ok(0) | Err(_) => return Ended::Closed,
             Ok(n) => n,
-            // A TLS server that closes the connection with no close_notify,
-            // as many do after `Connection: close`: the end of the response,
-            // as the openssl bufferevent takes it. rustls calls it an error.
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
-            Err(e) => return Err(e),
         };
-        if n == 0 || buf.len() >= MAX_RESPONSE_BYTES {
-            break;
+        if buf.len() >= MAX_RESPONSE_BYTES {
+            return Ended::Full;
         }
         reads.push((buf.len(), start.elapsed().as_secs_f64() * 1000.0));
         buf.extend_from_slice(&chunk[..n]);
@@ -559,10 +587,20 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
             if reader.taken == taken {
                 reads.pop();
             }
-            return Ok(Some(stop));
+            return Ended::Stop(stop);
         }
     }
-    Ok(None)
+}
+
+/// How [`exchange`] ended.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Ended {
+    /// Where readcb stops
+    Stop(Stop),
+    /// [`MAX_RESPONSE_BYTES`] were read
+    Full,
+    /// The connection ended before the response did
+    Closed,
 }
 
 /// What get_input takes at most: the room in httpget's line buffer,
@@ -851,11 +889,7 @@ impl Reader {
     /// chunk states they follow, with their own numbers.
     fn timed_out(&self, raw: &[u8], store_headers: usize) -> (String, Option<Vec<String>>) {
         use ReadState::*;
-        let header = || {
-            parse_response(&raw[..self.header_end], store_headers)
-                .ok()
-                .and_then(|p| p.header)
-        };
+        let header = || self.header(raw, store_headers);
         let readstate = match self.state {
             Status => return ("timeout reading status".into(), None),
             Header => {
@@ -876,6 +910,26 @@ impl Reader {
             self.parsed - self.line
         );
         (err, header())
+    }
+
+    /// Whether err_reading reports the connection's end where readcb is
+    /// (httpget.c:1928-1969): in the status line once something came, in
+    /// the header, in a body by its length or to the end. Before anything
+    /// came (READ_FIRST) and in a chunked body it says nothing, and the
+    /// fetch is reported when its timer fires, as the timer reports it.
+    fn reports_close(&self) -> bool {
+        match self.state {
+            ReadState::Status => self.taken > 0,
+            ReadState::Header | ReadState::Simple => true,
+            _ => false,
+        }
+    }
+
+    /// The whole header in `raw`, stored as `--store-headers` stores it.
+    fn header(&self, raw: &[u8], store_headers: usize) -> Option<Vec<String>> {
+        parse_response(&raw[..self.header_end], store_headers)
+            .ok()
+            .and_then(|p| p.header)
     }
 }
 
@@ -1865,6 +1919,106 @@ mod tests {
             assert_eq!(out.err.as_deref(), Some(err));
             assert_eq!(out.header.as_deref().unwrap(), header);
         }
+    }
+
+    /// What a fetch from a server that sends `writes` 100 ms apart and
+    /// then closes the connection (with a reset if `reset`) comes to, with
+    /// --store-headers 1024 and a 500 ms timeout; and whether it waited
+    /// for the timeout.
+    async fn closed(writes: &[&[u8]], reset: bool) -> (RawHttpOutcome, bool) {
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let writes: Vec<Vec<u8>> = writes.iter().map(|w| w.to_vec()).collect();
+        tokio::spawn(async move {
+            let (mut s, _) = server.accept().await.unwrap();
+            let mut req = vec![0u8; 512];
+            let _ = s.read(&mut req).await.unwrap();
+            for write in writes {
+                s.write_all(&write).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if reset {
+                socket2::SockRef::from(&s)
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+            }
+        });
+        let url = parse_http_url(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let started = Instant::now();
+        let out = one(fetch_via(
+            None,
+            anywhere,
+            &url,
+            &opts(4, 1024, Duration::from_millis(500), None),
+        )
+        .await
+        .unwrap());
+        (out, started.elapsed() >= Duration::from_millis(500))
+    }
+
+    /// A connection that ends before the response does is err_reading's
+    /// (httpget.c:1928-1969), an end of file and a reset alike: by where
+    /// readcb was, "error reading status", "error reading headers" after
+    /// the header lines so far, "error reading body" after the whole
+    /// header — none of them done, so no rt, res, ver, hsize or bsize. A
+    /// body without a Content-Length ends with the connection. Before
+    /// anything came, and in a chunked body, err_reading says nothing and
+    /// the timer reports the fetch. Starla parsed what had come as the
+    /// whole response, or said "error reading response: <why>".
+    #[tokio::test]
+    async fn a_connection_that_ends_early_is_reported_by_where_it_was() {
+        const SHORT: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n";
+        for reset in [false, true] {
+            let (out, waited) = closed(&[SHORT, &[b'x'; 400]], reset).await;
+            assert!(!waited && !out.done, "{out:?}");
+            assert_eq!(out.err.as_deref(), Some("error reading body"));
+            assert_eq!(out.header.as_deref().unwrap(), ["Content-Length: 1000", ""]);
+            let body = crate::http::result_body(1001, 1, &out);
+            assert!(
+                body.contains(
+                    "{ \"header\": [ \"Content-Length: 1000\", \"\" ], \
+                     \"err\":\"error reading body\", \"method\":\"GET\", "
+                ),
+                "{body}"
+            );
+            for field in ["\"rt\"", "\"res\"", "\"bsize\""] {
+                assert!(!body.contains(field), "{body}");
+            }
+
+            let (out, waited) = closed(&[b"HTTP/1.1 200 OK\r\nX-A: 1\r\nX-B"], reset).await;
+            assert!(!waited, "{out:?}");
+            assert_eq!(out.err.as_deref(), Some("error reading headers"));
+            assert_eq!(out.header.as_deref().unwrap(), ["X-A: 1"]);
+
+            let (out, waited) = closed(&[b"HTTP/1.1 2"], reset).await;
+            assert!(!waited, "{out:?}");
+            assert_eq!(out.err.as_deref(), Some("error reading status"));
+            assert_eq!(out.header, None);
+        }
+
+        let (out, waited) =
+            closed(&[b"HTTP/1.0 200 OK\r\nServer: x\r\n\r\n", b"hello"], false).await;
+        assert!(!waited && out.done && out.err.is_none(), "{out:?}");
+        assert_eq!((out.res, out.hsize, out.bsize), (200, 11, 5));
+
+        let (out, waited) = closed(&[], false).await;
+        assert!(waited, "{out:?}");
+        assert_eq!(out.err.as_deref(), Some("timeout reading status"));
+
+        let (out, waited) = closed(
+            &[b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab"],
+            true,
+        )
+        .await;
+        assert!(waited, "{out:?}");
+        assert_eq!(
+            out.err.as_deref(),
+            Some("timeout reading chunk: state 6 linelen 0 lineoffset 0")
+        );
+        assert_eq!(
+            out.header.as_deref().unwrap(),
+            ["Transfer-Encoding: chunked", ""]
+        );
     }
 
     #[test]
