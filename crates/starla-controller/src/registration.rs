@@ -16,7 +16,7 @@ pub const MIN_WAIT_SECS: i64 = 100;
 pub const MAX_WAIT_SECS: i64 = 28 * 24 * 3600;
 
 /// The wait atlasinit forces when a server answers neither OK nor WAIT
-/// (ATLAS_DEFAULT_WAIT), and after a controller's REFUSED.
+/// (ATLAS_DEFAULT_WAIT), a controller's REFUSED among them.
 pub const DEFAULT_WAIT_SECS: i64 = 100;
 
 /// The reason the reference writes to force_reg.txt when the controller
@@ -31,8 +31,8 @@ pub struct RegState {
     pub rereg_at: Option<i64>,
     /// REG_WAIT_UNTIL: a registration server's WAIT (unix seconds).
     pub wait_until: Option<i64>,
-    /// force_reg.sh: a controller REFUSED us; register again, whatever the
-    /// timers say. Holds the controller's reason, for the log.
+    /// force_reg.txt: the controller kicked us out from KEEP; register
+    /// again, whatever the timers say. Holds the reason, for the log.
     pub forced: Option<String>,
 }
 
@@ -89,22 +89,13 @@ impl RegState {
     ///
     /// reginit.sh deletes force_reg.sh after every registration attempt, before
     /// it reads REG_WAIT_UNTIL, so a server's explicit WAIT takes over from an
-    /// earlier controller REFUSED. If we kept `forced` here, `next_step` would
+    /// earlier kick from KEEP. If we kept `forced` here, `next_step` would
     /// answer FORCE_REG again on the very next call and the probe would
     /// re-handshake with the registration servers back to back, without pause,
     /// for as long as the key stays unapproved.
     pub fn told_to_wait(&mut self, secs: i64, now: i64) {
         self.wait_until = Some(now + clamp_wait(secs));
         self.forced = None;
-    }
-
-    /// A controller said REFUSED: drop the assignment, register again.
-    pub fn refused(&mut self, reason: &str) {
-        self.controller = None;
-        self.rereg_at = None;
-        // A forced registration re-runs now, whatever wait a server set.
-        self.wait_until = None;
-        self.forced = Some(reason.to_string());
     }
 
     /// The controller kicked us out from KEEP: it wrote on the KEEP channel
@@ -114,8 +105,15 @@ impl RegState {
     /// reginit then drops con_init_conf.txt and registers with R=FORCE_REG
     /// (reginit.sh.in:56-60), and a controller INIT gives a new SESSION_ID.
     /// KEEP again on the old session is refused each time.
+    ///
+    /// A controller's REFUSED to INIT is not this: it keeps the assignment
+    /// ([`ConKeep::refused`]).
     pub fn kicked_out(&mut self) {
-        self.refused(CON_KEEP_BROKEN);
+        self.controller = None;
+        self.rereg_at = None;
+        // A forced registration re-runs now, whatever wait a server set.
+        self.wait_until = None;
+        self.forced = Some(CON_KEEP_BROKEN.to_string());
     }
 
     /// Read the saved state; a missing or unreadable file is no state (a
@@ -231,6 +229,22 @@ impl ConKeep {
         self.wait_until = Some(until);
     }
 
+    /// The controller answered INIT with REFUSED; wait until `until`, then
+    /// INIT again on the same assignment. atlasinit never takes that reply
+    /// for a REFUSED: it has cut the line's '\n' (atlasinit.c:251-257)
+    /// when it tests `strncmp(line, "REFUSED\n", 8)` (:402), so the reply
+    /// is its "OK expected" error, and con_keep_conf.txt holds
+    /// CON_WAIT_TIMER of ATLAS_DEFAULT_WAIT alone (:412-417), with no
+    /// force_reg.txt. reginit sleeps it out, drops the file and runs a
+    /// controller INIT again (reginit.sh.in:431-441, 455-506); the
+    /// registration is untouched.
+    pub fn refused(&mut self, until: i64) {
+        *self = Self {
+            wait_until: Some(until),
+            ..Self::default()
+        };
+    }
+
     pub fn clear(&mut self) {
         *self = Self::default();
     }
@@ -341,25 +355,36 @@ mod tests {
         assert_eq!(st.wait_until, Some(NOW + MAX_WAIT_SECS));
     }
 
+    /// A controller's REFUSED is atlasinit's "OK expected" error: a
+    /// CON_WAIT_TIMER of ATLAS_DEFAULT_WAIT, kept across a restart, the
+    /// cached session gone, and the assignment as it was -- no FORCE_REG.
     #[test]
-    fn a_refusal_forces_a_registration() {
+    fn a_controllers_refusal_waits_and_keeps_the_assignment() {
         let mut st = RegState::default();
         st.registered(&ctr(Some(86_400)), NOW);
-        st.refused("controller restarting");
-        let saved = RegState::parse(&st.render());
-        assert_eq!(saved.next_step(NOW + 1), RegStep::Register("FORCE_REG"));
-        assert_eq!(saved.controller, None);
+        let mut ck = ConKeep::default();
+        ck.set_ready(37_214, "sess-1".into());
+
+        ck.refused(NOW + DEFAULT_WAIT_SECS);
+        let saved = ConKeep::parse(&ck.render());
+        assert_eq!(saved, ck);
+        assert_eq!(saved.waiting_until(NOW), Some(NOW + DEFAULT_WAIT_SECS));
+        assert_eq!(saved.reusable(NOW + DEFAULT_WAIT_SECS), None, "INIT again");
+
+        assert_eq!(st.forced, None);
+        assert!(matches!(st.next_step(NOW + 1), RegStep::Cached(_)));
     }
 
     #[test]
-    fn a_wait_after_a_refusal_stops_the_forced_registration() {
-        // A controller REFUSED (forced), then the registration server answered
-        // WAIT because the key is not approved yet. reginit drops FORCE_REG
-        // before reading REG_WAIT_UNTIL, so the wait must win -- otherwise the
-        // probe re-handshakes with the registration servers without pause.
+    fn a_wait_after_a_kick_stops_the_forced_registration() {
+        // Kicked out from KEEP (forced), then the registration server
+        // answered WAIT because the key is not approved yet. reginit drops
+        // FORCE_REG before reading REG_WAIT_UNTIL, so the wait must win --
+        // otherwise the probe re-handshakes with the registration servers
+        // without pause.
         let mut st = RegState::default();
         st.registered(&ctr(Some(86_400)), NOW);
-        st.refused("key not approved");
+        st.kicked_out();
         assert_eq!(st.next_step(NOW), RegStep::Register("FORCE_REG"));
 
         st.told_to_wait(600, NOW);

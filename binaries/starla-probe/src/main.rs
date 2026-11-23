@@ -1232,22 +1232,41 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
                                 ctrl_retry!('register_and_connect);
                             }
                             Ok(InitResponse::Refused { reason }) => {
-                                // atlasinit's REFUSED branch only writes
-                                // force_reg.sh; the wait before re-registering is
-                                // Starla's own, so a refusal does not spin.
-                                warn!(
-                                    "Controller refused us ({}); registering again in {}-{}s",
-                                    reason,
-                                    DEFAULT_WAIT_SECS,
-                                    // jittered() lengthens a wait past the cap by up to JITTER
-                                    (DEFAULT_WAIT_SECS as f64 * (1.0 + JITTER)) as i64
+                                // What deployed probes do (ConKeep::refused):
+                                // atlasinit takes the reply for an error, waits
+                                // ATLAS_DEFAULT_WAIT, and reginit then runs a
+                                // controller INIT again, on the same
+                                // assignment, over a new connection. No
+                                // registration. jittered() only lengthens a
+                                // wait past the cap: 100-120 s, never under
+                                // atlasinit's 100 s minimum.
+                                let wait = jittered(
+                                    Duration::from_secs(DEFAULT_WAIT_SECS as u64),
+                                    min_ctrl_delay,
+                                    max_ctrl_delay,
                                 );
-                                reg.refused(&reason);
-                                save_reg(&reg, &reg_path);
-                                con_keep.clear();
+                                warn!(
+                                    "Controller refused us ({}); asking it again in {}s",
+                                    reason,
+                                    wait.as_secs()
+                                );
+                                probe_status.lock().await.last_connection_error =
+                                    Some(format!("Controller refused us ({})", reason));
+                                con_keep.refused(unix_now() + wait.as_secs() as i64);
                                 save_con_keep(&con_keep, &con_keep_path);
-                                ctrl_delay = Duration::from_secs(DEFAULT_WAIT_SECS as u64);
-                                ctrl_retry!('register_and_connect);
+                                drop(ctrl_ssh);
+                                tokio::select! {
+                                    _ = shutdown.cancelled() => {
+                                        info!("Shutting down during wait");
+                                        scheduler_cancel.cancel();
+                                        metrics_cancel_token.cancel();
+                                        result_cancel_token.cancel();
+                                        return Ok(());
+                                    }
+                                    _ = tokio::time::sleep(wait) => {
+                                        continue 'register_and_connect;
+                                    }
+                                }
                             }
                             Err(e) => {
                                 // The reference's reginit.sh exits on a failed
