@@ -1646,12 +1646,13 @@ fn parse_port_range(s: &str) -> Option<(u16, u16)> {
 }
 
 /// A uniformly chosen even port in `[lo, hi]` (`lo` if there is none).
+/// An odd `lo` of 65535 has no even port above it in a `u16`: `lo + 1`
+/// overflowed there.
 fn even_port_in((lo, hi): (u16, u16)) -> u16 {
     use rand::RngExt;
-    let first = lo + lo % 2;
-    if first > hi {
+    let Some(first) = lo.checked_add(lo % 2).filter(|&first| first <= hi) else {
         return lo;
-    }
+    };
     first + 2 * rand::rng().random_range(0..=(hi - first) / 2)
 }
 
@@ -1682,6 +1683,16 @@ mod originator_tests {
         for _ in 0..100 {
             assert!([32770, 32772].contains(&even_port_in((32769, 32773))));
         }
+    }
+
+    #[test]
+    fn a_range_at_the_top_of_the_ports_gives_a_port_in_it() {
+        // "65535 65535" has no even port: the first even one after 65535
+        // overflowed (a panic in debug, port 0 in release)
+        assert_eq!(parse_port_range("65535 65535"), Some((65535, 65535)));
+        assert_eq!(even_port_in((65535, 65535)), 65535);
+        assert_eq!(even_port_in((65534, 65535)), 65534);
+        assert_eq!(even_port_in((65533, 65535)), 65534);
     }
 }
 
