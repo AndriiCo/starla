@@ -795,10 +795,19 @@ impl Reader {
                     let size = line.split(|c: char| c.is_ascii_whitespace()).next();
                     match size.and_then(|s| usize::from_str_radix(s, 16).ok()) {
                         Some(0) => self.state = Trailer,
-                        Some(size) => {
-                            self.chunk_end += size;
-                            self.state = ChunkBody;
-                        }
+                        // tot_chunked is an int (httpget.c:128, 1560): a
+                        // total past INT_MAX is one httpget cannot follow
+                        Some(size) => match self
+                            .chunk_end
+                            .checked_add(size)
+                            .filter(|&end| end <= i32::MAX as usize)
+                        {
+                            Some(end) => {
+                                self.chunk_end = end;
+                                self.state = ChunkBody;
+                            }
+                            None => return malformed,
+                        },
                         None => return malformed,
                     }
                 }
@@ -1435,6 +1444,31 @@ mod tests {
         );
         // Not there yet: more is read
         assert_eq!(limited(8000, false, &[HEADER, &body]), (None, 2));
+    }
+
+    /// A chunk size that takes the body's total past what httpget's int
+    /// tot_chunked holds is malformed, read no further (httpget.c:128,
+    /// 1546-1560). Starla added it to its total unchecked: a panic with
+    /// overflow checks, a wrapped total without.
+    #[test]
+    fn a_chunk_size_past_an_int_is_malformed() {
+        let start: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        for chunks in [
+            &b"1\r\na\r\nffffffffffffffff\r\nabc"[..],
+            b"ffffffffffffffff\r\nabc",
+            b"80000000\r\nabc",
+        ] {
+            let all = [start, chunks].concat();
+            assert_eq!(
+                limited(1 << 20, false, &[&all]),
+                (Some(Stop::End(all.len())), 1),
+                "{}",
+                String::from_utf8_lossy(chunks)
+            );
+        }
+        // INT_MAX itself is a size httpget reads on
+        let all = [start, b"7fffffff\r\nabc"].concat();
+        assert_eq!(limited(1 << 20, false, &[&all]), (None, 1));
     }
 
     /// A server on 127.0.0.1 for one connection that checks the request
