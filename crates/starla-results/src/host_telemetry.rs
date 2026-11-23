@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 #[cfg(any(target_os = "linux", test))]
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 #[cfg(target_os = "linux")]
@@ -33,16 +34,91 @@ pub enum HostTelemetryKind {
     Rptaddrs,
 }
 
+/// A telemetry line as it was scheduled: what its reporter runs. Two
+/// lines are the same line when all of this is the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReportLine {
+    Buddyinfo {
+        interval: u64,
+        lowmem: Option<u32>,
+        msm_id: Option<u32>,
+    },
+    Rptaddrs {
+        interval: u64,
+        msm_id: u32,
+    },
+}
+
+impl ReportLine {
+    fn kind(&self) -> HostTelemetryKind {
+        match self {
+            Self::Buddyinfo { .. } => HostTelemetryKind::Buddyinfo,
+            Self::Rptaddrs { .. } => HostTelemetryKind::Rptaddrs,
+        }
+    }
+
+    fn interval(&self) -> u64 {
+        match *self {
+            Self::Buddyinfo { interval, .. } | Self::Rptaddrs { interval, .. } => interval,
+        }
+    }
+}
+
+/// What makes a line's report: [`report_line`], or a test's stand-in.
+type Produce = fn(&ReportLine, &Arc<HostTelemetry>) -> Option<String>;
+
+fn report_line(line: &ReportLine, telem: &Arc<HostTelemetry>) -> Option<String> {
+    match *line {
+        ReportLine::Buddyinfo { lowmem, msm_id, .. } => buddyinfo_line(lowmem, msm_id),
+        ReportLine::Rptaddrs { msm_id, .. } => rptaddrs_line(msm_id, telem),
+    }
+}
+
+/// One kind's lines, and the reporter running the one that counts.
+#[derive(Default)]
+struct Reporter {
+    /// The probe's own line, scheduled before the first session: the
+    /// address report the reference runs in its main loop. It runs while
+    /// no crontab line of its kind does.
+    probe: Option<ReportLine>,
+    /// The controller's line, from a crontab
+    crontab: Option<CrontabReport>,
+    /// The line being run, and its task
+    running: Option<(ReportLine, JoinHandle<()>)>,
+}
+
+struct CrontabReport {
+    line: ReportLine,
+    /// Sent since crons/main last ended
+    sent: bool,
+}
+
 /// Shared state collecting host-telemetry RESULT lines for the next upload.
 ///
 /// Reporters push lines via internal periodic tasks; the uploader drains
 /// pending lines once per upload cycle.
-#[derive(Default)]
 pub struct HostTelemetry {
     pending: Mutex<Vec<String>>,
-    tasks: Mutex<HashMap<HostTelemetryKind, JoinHandle<()>>>,
+    reporters: Mutex<HashMap<HostTelemetryKind, Reporter>>,
+    /// A session has begun: lines scheduled from now on are the
+    /// controller's, from its crontabs
+    in_session: AtomicBool,
+    produce: Produce,
     #[cfg(target_os = "linux")]
     rptaddrs_cache: Mutex<RptaddrsCache>,
+}
+
+impl Default for HostTelemetry {
+    fn default() -> Self {
+        Self {
+            pending: Mutex::default(),
+            reporters: Mutex::default(),
+            in_session: AtomicBool::new(false),
+            produce: report_line,
+            #[cfg(target_os = "linux")]
+            rptaddrs_cache: Mutex::default(),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -98,8 +174,10 @@ impl HostTelemetry {
         lowmem: Option<u32>,
         msm_id: Option<u32>,
     ) {
-        self.schedule(HostTelemetryKind::Buddyinfo, interval, move |_| {
-            buddyinfo_line(lowmem, msm_id)
+        self.schedule(ReportLine::Buddyinfo {
+            interval,
+            lowmem,
+            msm_id,
         })
         .await;
     }
@@ -108,41 +186,116 @@ impl HostTelemetry {
     ///
     /// `msm_id` is the controller-assigned measurement id (the `-A` flag).
     pub async fn schedule_rptaddrs(self: &Arc<Self>, interval: u64, msm_id: u32) {
-        self.schedule(HostTelemetryKind::Rptaddrs, interval, move |me| {
-            rptaddrs_line(msm_id, &me)
-        })
-        .await;
+        self.schedule(ReportLine::Rptaddrs { interval, msm_id })
+            .await;
     }
 
-    /// Generic scheduler: spawns (or replaces) a task that calls `make_line()`
-    /// every `interval` seconds and pushes its result. Runs once immediately
-    /// to mirror eperd's behaviour of producing a first sample on schedule.
-    async fn schedule<F>(self: &Arc<Self>, kind: HostTelemetryKind, interval: u64, make_line: F)
-    where
-        F: Fn(Arc<Self>) -> Option<String> + Send + Sync + 'static,
-    {
+    /// A line scheduled before the first session is the probe's own; one
+    /// scheduled after is a crontab's, and stands in for the probe's own
+    /// of its kind while crons/main keeps sending it
+    /// ([`crons_main_ended`](Self::crons_main_ended)). The line that
+    /// counts keeps its reporter, and its timing, when it is the one
+    /// already running: a crontab push that repeats a line adds no report,
+    /// as eperd and perd keep a line that the crontab they read anew
+    /// repeats (Insert, eperd.c:782-836; CopyFromOld, perd.c:654-712).
+    /// Otherwise a new reporter replaces the old one and reports at once.
+    /// A line with `interval == 0` runs once and leaves the reporter be.
+    async fn schedule(self: &Arc<Self>, line: ReportLine) {
+        if line.interval() == 0 {
+            drop(self.spawn(line));
+            return;
+        }
+        let kind = line.kind();
+        let mut reporters = self.reporters.lock().await;
+        let reporter = reporters.entry(kind).or_default();
+        if self.in_session.load(Ordering::Relaxed) {
+            reporter.crontab = Some(CrontabReport { line, sent: true });
+        } else {
+            reporter.probe = Some(line);
+        }
+        self.run_counting_line(kind, reporter);
+    }
+
+    /// A session has begun: the lines scheduled from now on come from the
+    /// controller's crontabs.
+    pub(crate) fn session_started(&self) {
+        self.in_session.store(true, Ordering::Relaxed);
+    }
+
+    /// crons/main has ended: the controller's lines sent since it last
+    /// ended are its lines, and one not sent since stops, as perd and eperd
+    /// drop the lines a crontab they read anew no longer has (DeleteFile,
+    /// perd.c:555, 720-755; eperd.c:644). The probe's own line of its kind
+    /// then runs again. Only crons/main's end is seen here, so a line that
+    /// another crontab sent in between counts as sent.
+    pub(crate) async fn crons_main_ended(self: &Arc<Self>) {
+        let mut reporters = self.reporters.lock().await;
+        for (&kind, reporter) in reporters.iter_mut() {
+            match &mut reporter.crontab {
+                Some(c) if c.sent => c.sent = false,
+                Some(c) => {
+                    debug!(?kind, line = ?c.line, "telemetry line no longer sent: stopped");
+                    reporter.crontab = None;
+                }
+                None => {}
+            }
+            self.run_counting_line(kind, reporter);
+        }
+    }
+
+    /// Run the line of `reporter` that counts, the crontab's or else the
+    /// probe's own, unless it is the one running.
+    fn run_counting_line(self: &Arc<Self>, kind: HostTelemetryKind, reporter: &mut Reporter) {
+        let line = reporter.crontab.as_ref().map(|c| c.line).or(reporter.probe);
+        if let (Some((running, _)), Some(line)) = (&reporter.running, line) {
+            if *running == line {
+                trace!(?kind, ?line, "telemetry line unchanged: keeps its schedule");
+                return;
+            }
+        }
+        if let Some((_, task)) = reporter.running.take() {
+            task.abort();
+        }
+        match line {
+            Some(line) => {
+                debug!(?kind, ?line, "scheduled telemetry");
+                reporter.running = Some((line, self.spawn(line)));
+            }
+            None => debug!(?kind, "no telemetry line"),
+        }
+    }
+
+    /// A task that reports `line` at once, then every `interval` seconds;
+    /// once only when that is 0.
+    fn spawn(self: &Arc<Self>, line: ReportLine) -> JoinHandle<()> {
         let me = Arc::clone(self);
-        let new_handle = tokio::spawn(async move {
-            // First report runs immediately, then every `interval`.
+        let interval = line.interval();
+        tokio::spawn(async move {
             loop {
-                match make_line(Arc::clone(&me)) {
-                    Some(line) => me.push(line).await,
-                    None => trace!(?kind, "telemetry reporter produced no line"),
+                match (me.produce)(&line, &me) {
+                    Some(report) => me.push(report).await,
+                    None => trace!(?line, "telemetry reporter produced no line"),
                 }
                 if interval == 0 {
                     return;
                 }
                 tokio::time::sleep(Duration::from_secs(interval)).await;
             }
-        });
+        })
+    }
 
-        let mut tasks = self.tasks.lock().await;
-        if let Some(old) = tasks.insert(kind, new_handle) {
-            old.abort();
-            debug!(?kind, interval, "replaced existing telemetry schedule");
-        } else {
-            debug!(?kind, interval, "scheduled telemetry");
-        }
+    /// The lines whose reporters are running
+    #[cfg(test)]
+    pub(crate) async fn running(&self) -> Vec<ReportLine> {
+        let reporters = self.reporters.lock().await;
+        let mut lines: Vec<ReportLine> = reporters
+            .values()
+            .filter_map(|r| r.running.as_ref())
+            .filter(|(_, task)| !task.is_finished())
+            .map(|(line, _)| *line)
+            .collect();
+        lines.sort_by_key(|line| line.kind() as u8);
+        lines
     }
 }
 
@@ -1214,6 +1367,148 @@ fec00000000000000000000000000001 02 40 40 80     eth0
         assert!(line.contains("\"inet-routes\": ["), "{line}");
         assert!(line.contains("\"inet-dhcp\": true"), "{line}");
         assert!(line.ends_with(" ]}\n"), "{line}");
+    }
+
+    /// Telemetry whose reports name the line, on any OS
+    fn telemetry() -> Arc<HostTelemetry> {
+        fn report(line: &ReportLine, _: &Arc<HostTelemetry>) -> Option<String> {
+            Some(format!("{line:?}"))
+        }
+        Arc::new(HostTelemetry {
+            produce: report,
+            ..HostTelemetry::default()
+        })
+    }
+
+    const BUDDYINFO: ReportLine = ReportLine::Buddyinfo {
+        interval: 600,
+        lowmem: Some(2048),
+        msm_id: None,
+    };
+
+    /// A crons/main push with a buddyinfo line, of `interval` and `lowmem`
+    async fn push_buddyinfo(t: &Arc<HostTelemetry>, interval: u64, lowmem: u32) {
+        t.schedule_buddyinfo(interval, Some(lowmem), None).await;
+        t.crons_main_ended().await;
+    }
+
+    /// What the reporters queued, once they have run
+    async fn reported(t: &HostTelemetry) -> Vec<String> {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        t.drain().await
+    }
+
+    /// The controller pushes crons/main each session and on every hourly
+    /// REREGISTER, each time with the lines it had. A repeated line keeps
+    /// the reporter it has, on its schedule, as eperd and perd keep a line
+    /// the crontab they read anew repeats: each push used to start a new
+    /// reporter, which reported at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_repeated_telemetry_line_adds_no_report() {
+        let t = telemetry();
+        t.session_started();
+        push_buddyinfo(&t, 600, 2048).await;
+        assert_eq!(reported(&t).await, [format!("{BUDDYINFO:?}")]);
+
+        tokio::time::sleep(Duration::from_secs(100)).await;
+        for _ in 0..20 {
+            push_buddyinfo(&t, 600, 2048).await;
+        }
+        assert!(reported(&t).await.is_empty(), "no report off its schedule");
+        assert_eq!(t.running().await, [BUDDYINFO], "one reporter");
+
+        // At 600 s, its next report: one, from the one reporter
+        tokio::time::sleep(Duration::from_secs(501)).await;
+        assert_eq!(reported(&t).await, [format!("{BUDDYINFO:?}")]);
+    }
+
+    /// A crons/main push without the line stops its reporter.
+    #[tokio::test(start_paused = true)]
+    async fn a_telemetry_line_crons_main_leaves_out_stops() {
+        let t = telemetry();
+        t.session_started();
+        push_buddyinfo(&t, 600, 2048).await;
+        assert_eq!(reported(&t).await.len(), 1);
+
+        t.crons_main_ended().await;
+        assert!(t.running().await.is_empty());
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert!(reported(&t).await.is_empty(), "stopped");
+    }
+
+    /// A changed line replaces the old one: the new reporter reports at
+    /// once and on its own interval, and the old one no more.
+    #[tokio::test(start_paused = true)]
+    async fn a_changed_telemetry_line_replaces_the_old_one() {
+        let t = telemetry();
+        t.session_started();
+        push_buddyinfo(&t, 600, 2048).await;
+        assert_eq!(reported(&t).await.len(), 1);
+
+        tokio::time::sleep(Duration::from_secs(100)).await;
+        push_buddyinfo(&t, 300, 1024).await;
+        let new = ReportLine::Buddyinfo {
+            interval: 300,
+            lowmem: Some(1024),
+            msm_id: None,
+        };
+        assert_eq!(reported(&t).await, [format!("{new:?}")]);
+        assert_eq!(t.running().await, [new]);
+
+        // 400, 700 and 1000 s; none of the old line's at 600
+        tokio::time::sleep(Duration::from_secs(1000)).await;
+        assert_eq!(reported(&t).await, vec![format!("{new:?}"); 3]);
+    }
+
+    /// The probe's own address report, scheduled before the first session,
+    /// is no crontab's: a crons/main push does not stop it. A crontab's
+    /// rptaddrs line stands in for it while crons/main sends that line, and
+    /// once crons/main leaves it out the probe's own runs again.
+    #[tokio::test(start_paused = true)]
+    async fn the_probes_own_rptaddrs_outlasts_the_crontabs() {
+        let t = telemetry();
+        let own = ReportLine::Rptaddrs {
+            interval: 180,
+            msm_id: 9104,
+        };
+        t.schedule_rptaddrs(180, 9104).await;
+        t.session_started();
+        assert_eq!(reported(&t).await.len(), 1);
+        t.crons_main_ended().await;
+        assert_eq!(t.running().await, [own]);
+        assert!(reported(&t).await.is_empty());
+
+        // The same line in a crontab is the line running: no report
+        t.schedule_rptaddrs(180, 9104).await;
+        t.crons_main_ended().await;
+        assert!(reported(&t).await.is_empty());
+
+        let crontabs = ReportLine::Rptaddrs {
+            interval: 60,
+            msm_id: 9104,
+        };
+        t.schedule_rptaddrs(60, 9104).await;
+        t.crons_main_ended().await;
+        assert_eq!(t.running().await, [crontabs]);
+        assert_eq!(reported(&t).await.len(), 1);
+
+        t.crons_main_ended().await;
+        assert_eq!(t.running().await, [own]);
+    }
+
+    /// A one-shot line (a ONEOFF's) reports once and leaves the crontab's
+    /// reporter running.
+    #[tokio::test(start_paused = true)]
+    async fn a_one_shot_line_leaves_the_reporter_be() {
+        let t = telemetry();
+        t.session_started();
+        push_buddyinfo(&t, 600, 2048).await;
+        assert_eq!(reported(&t).await.len(), 1);
+        t.schedule_buddyinfo(0, None, None).await;
+        assert_eq!(reported(&t).await.len(), 1);
+        assert_eq!(t.running().await, [BUDDYINFO]);
     }
 
     #[tokio::test]

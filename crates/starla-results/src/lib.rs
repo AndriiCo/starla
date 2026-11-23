@@ -128,11 +128,14 @@ struct CondmvRun {
 struct PostLine {
     target: PostTarget,
     slots: Slots,
+    /// Sent since crons/main last ended
+    sent: bool,
 }
 
 /// The controller's httppost lines, one of each kind; the last one sent of
-/// a kind wins. Empty until the controller's crontab arrives, and emptied
-/// by a new session (its URLs carry the old SESSION_ID).
+/// a kind wins. Empty until the controller's crontab arrives, emptied by a
+/// new session (its URLs carry the old SESSION_ID), and a line goes once a
+/// crons/main push leaves it out ([`PostLines::crons_main_ended`]).
 #[derive(Default)]
 struct PostLines {
     /// The line with `--post-dir`
@@ -147,6 +150,28 @@ impl PostLines {
             &mut self.main
         } else {
             &mut self.header_only
+        }
+    }
+
+    /// crons/main has ended: a line it sent stays, one it did not goes, as
+    /// perd drops the lines of its crontab that the crontab it reads anew
+    /// no longer has (SynchronizeFile's DeleteFile, perd.c:555, 720-755).
+    /// Only crons/main's end is seen here, so a line that another crontab
+    /// sent in between counts as sent; perd, the one daemon that runs
+    /// httppost, reads crons/main only.
+    fn crons_main_ended(&mut self) {
+        for (post_dir, slot) in [(true, &mut self.main), (false, &mut self.header_only)] {
+            match slot {
+                Some(line) if line.sent => line.sent = false,
+                Some(line) => {
+                    debug!(
+                        post_dir,
+                        "httppost line no longer sent: {}", line.target.path
+                    );
+                    *slot = None;
+                }
+                None => {}
+            }
         }
     }
 }
@@ -457,8 +482,12 @@ impl ResultHandler {
     /// Set the upload endpoint path (call after controller connection). A
     /// new endpoint is a new session: the old session's httppost lines go
     /// (their URLs name its SESSION_ID), and Starla's own cadence holds until
-    /// the new crontab brings new ones.
+    /// the new crontab brings new ones. From the first session on, the
+    /// telemetry lines scheduled are the controller's, which its crontab
+    /// pushes replace; those scheduled before are the probe's own
+    /// ([`HostTelemetry::schedule_rptaddrs`]).
     pub async fn set_endpoint_path(&self, path: String) -> anyhow::Result<()> {
+        self.host_telemetry.session_started();
         let mut uploader = self.uploader.lock().await;
         let changed = uploader.default_target(None).path != path;
         uploader.set_endpoint_path(path)?;
@@ -505,7 +534,11 @@ impl ResultHandler {
             "httppost line: {}",
             target.path
         );
-        *slot = Some(PostLine { target, slots });
+        *slot = Some(PostLine {
+            target,
+            slots,
+            sent: true,
+        });
         drop(lines);
         self.lines_changed.notify_one();
         Ok(())
@@ -516,6 +549,12 @@ impl ResultHandler {
     /// the httppost lines do. A line the crontab repeats keeps its slot
     /// (perd's CopyFromOld); a line perd would refuse (an interval outside
     /// 1..=2 years, a negative start time) is left out.
+    ///
+    /// This is crons/main's end, so it is also when the crontab's other
+    /// lines are replaced as a whole: an httppost or telemetry line sent
+    /// since crons/main last ended stays, keeping its slots or its reporter
+    /// when it is the line already there, and one not sent since goes, as
+    /// perd keeps only the lines of the crontab it reads anew.
     pub async fn set_condmv_lines(&self, lines: Vec<CondmvLine>) {
         let now = self.wall_now() as i64;
         let mut runs = self.condmv_lines.lock().await;
@@ -548,6 +587,8 @@ impl ResultHandler {
             runs.push(CondmvRun { condmv, slots });
         }
         drop(runs);
+        self.lines.lock().await.crons_main_ended();
+        self.host_telemetry.crons_main_ended().await;
         self.lines_changed.notify_one();
     }
 
@@ -2542,6 +2583,11 @@ mod tests {
         let cancel = start(&handler);
         // condmv at …141 and …201, posts at …152 and …212
         tokio::time::sleep(Duration::from_secs(105)).await;
+        // crons/main again, its httppost line repeated and no condmv line
+        handler
+            .set_httppost_line(twin_line(60, 12, 0, None))
+            .await
+            .unwrap();
         handler.set_condmv_lines(Vec::new()).await;
         tokio::time::sleep(Duration::from_secs(60)).await;
         cancel.cancel();
@@ -2677,5 +2723,93 @@ mod tests {
             let bad = twin_line(interval, start_time, 0, None);
             assert!(handler.set_httppost_line(bad).await.is_err());
         }
+    }
+
+    /// A crons/main push replaces the crontab's httppost lines as perd's
+    /// SynchronizeFile does: a repeated line keeps its slot, a changed one
+    /// replaces it, and one the push leaves out goes, which used to stay
+    /// until the next session.
+    #[tokio::test(start_paused = true)]
+    async fn a_crons_main_push_replaces_its_httppost_lines() {
+        let (transport, _seen) = answering(&[OK]);
+        let (handler, t0) = twin_handler(transport).await;
+        let main = twin_line(60, 12, 20, None);
+        let timesync = twin_line(900, 312, 20, Some("timesync"));
+        handler.set_httppost_line(main.clone()).await.unwrap();
+        handler.set_httppost_line(timesync.clone()).await.unwrap();
+        handler.set_condmv_lines(vec![crons_main_condmv()]).await;
+        let next = handler.line_deadline(true, t0).await;
+        assert!(matches!(next, Some(Some(_))));
+
+        // Repeated: kept, on its slot
+        for _ in 0..20 {
+            handler.set_httppost_line(main.clone()).await.unwrap();
+            handler.set_httppost_line(timesync.clone()).await.unwrap();
+            handler.set_condmv_lines(vec![crons_main_condmv()]).await;
+            assert_eq!(handler.line_deadline(true, t0).await, next, "slot kept");
+        }
+
+        // Changed: replaced
+        let changed = twin_line(120, 12, 0, None);
+        handler.set_httppost_line(changed.clone()).await.unwrap();
+        handler.set_httppost_line(timesync.clone()).await.unwrap();
+        handler.set_condmv_lines(vec![crons_main_condmv()]).await;
+        let schedule = handler
+            .lines
+            .lock()
+            .await
+            .main
+            .as_ref()
+            .unwrap()
+            .slots
+            .schedule;
+        assert_eq!(schedule, changed.schedule);
+
+        // Left out: gone, and Starla's own cadence posts
+        handler.set_httppost_line(changed).await.unwrap();
+        handler.set_condmv_lines(vec![crons_main_condmv()]).await;
+        assert!(handler.line_deadline(true, t0).await.is_some());
+        assert_eq!(
+            handler.line_deadline(false, t0).await,
+            None,
+            "timesync gone"
+        );
+        handler.set_condmv_lines(vec![crons_main_condmv()]).await;
+        assert_eq!(handler.line_deadline(true, t0).await, None, "main gone");
+    }
+
+    /// The telemetry lines go with crons/main's push too, and the probe's
+    /// own rptaddrs, scheduled before the first session, is none of them.
+    #[tokio::test(start_paused = true)]
+    async fn a_crons_main_push_replaces_its_telemetry_lines() {
+        let (transport, _seen) = answering(&[OK]);
+        let handler = ResultHandler::new(
+            transport,
+            UploaderConfig::default(),
+            ResultHandlerConfig::default(),
+            starla_metrics::MetricsRegistry::new().unwrap(),
+        );
+        let telemetry = handler.host_telemetry();
+        telemetry.schedule_rptaddrs(180, 9104).await;
+        handler
+            .set_endpoint_path(format!("/?PROBE_ID=1018212&SESSION_ID={SID}"))
+            .await
+            .unwrap();
+        let own = host_telemetry::ReportLine::Rptaddrs {
+            interval: 180,
+            msm_id: 9104,
+        };
+        let buddyinfo = host_telemetry::ReportLine::Buddyinfo {
+            interval: 600,
+            lowmem: Some(2048),
+            msm_id: None,
+        };
+        for _ in 0..3 {
+            telemetry.schedule_buddyinfo(600, Some(2048), None).await;
+            handler.set_condmv_lines(vec![crons_main_condmv()]).await;
+            assert_eq!(telemetry.running().await, [buddyinfo, own]);
+        }
+        handler.set_condmv_lines(vec![crons_main_condmv()]).await;
+        assert_eq!(telemetry.running().await, [own]);
     }
 }
