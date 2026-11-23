@@ -519,8 +519,10 @@ async fn run_background(background: Background) -> Result<()> {
 
     let ended = run_probe(background, shutdown).await;
     // Every way out of run_probe but an error cancels the result handler;
-    // its last post needs this runtime, which ends when this returns.
-    if ended.is_ok() {
+    // its last post needs this runtime, which ends when this returns. A
+    // scheduler that stopped is the one error that comes back after that
+    // graceful shutdown.
+    if shut_down_gracefully(&ended) {
         let wait = starla_results::SHUTDOWN_POST_TIMEOUT + Duration::from_secs(5);
         if tokio::time::timeout(wait, result_handler.stopped())
             .await
@@ -530,6 +532,32 @@ async fn run_background(background: Background) -> Result<()> {
         }
     }
     ended
+}
+
+/// [`run_probe`]'s error when the scheduler task ended by itself: no
+/// measurement would run again, while the controller connection stayed up.
+/// It comes after the graceful shutdown, so that the process exits non-zero
+/// and the service's `Restart=on-failure` starts it again; an `Ok` exit
+/// left the probe dead.
+#[derive(Debug)]
+struct SchedulerStopped(String);
+
+impl std::fmt::Display for SchedulerStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the scheduler stopped ({})", self.0)
+    }
+}
+
+impl std::error::Error for SchedulerStopped {}
+
+/// Whether [`run_probe`] ended through its graceful shutdown, which
+/// cancels the result handler: on a shutdown, or after the scheduler
+/// stopped ([`SchedulerStopped`]).
+fn shut_down_gracefully(ended: &Result<()>) -> bool {
+    match ended {
+        Ok(()) => true,
+        Err(e) => e.is::<SchedulerStopped>(),
+    }
 }
 
 /// [`run_background`]'s work, until `shutdown` or an error.
@@ -852,6 +880,10 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
     // The waits after a KEEP ends. A run of kicks spans passes through
     // 'register_and_connect, so its back-off lives out here.
     let mut keep_waits = KeepWaits::new();
+
+    // Set when the scheduler task ended by itself: the graceful shutdown,
+    // then an error (SchedulerStopped).
+    let mut scheduler_stopped: Option<String> = None;
 
     // Back to the top of 'register_and_connect after ctrl_delay: the saved
     // assignment (if still valid) means no new registration.
@@ -1366,8 +1398,13 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
                             info!("Shutting down");
                             None
                         }
-                        _ = &mut scheduler_task => {
-                            error!("Scheduler task ended unexpectedly");
+                        ended = &mut scheduler_task => {
+                            let why = match ended {
+                                Ok(()) => "it returned".to_string(),
+                                Err(e) => e.to_string(),
+                            };
+                            error!("Scheduler task ended unexpectedly ({}); exiting", why);
+                            scheduler_stopped = Some(why);
                             None
                         }
                         result = keep_task => {
@@ -1481,7 +1518,10 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
 
     info!("Shutting down probe");
 
-    Ok(())
+    match scheduler_stopped {
+        Some(why) => Err(SchedulerStopped(why).into()),
+        None => Ok(()),
+    }
 }
 
 /// The controller's commands, as telnet hands them over: each made a
@@ -2189,6 +2229,17 @@ fn force_reregistration(reg_path: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stopped_scheduler_is_an_error_after_the_graceful_shutdown() {
+        let stopped: Result<()> = Err(SchedulerStopped("it returned".into()).into());
+        // main returns it, so the process exits non-zero ...
+        assert!(stopped.is_err());
+        // ... once the result handler has made its last post
+        assert!(shut_down_gracefully(&stopped));
+        assert!(shut_down_gracefully(&Ok(())));
+        assert!(!shut_down_gracefully(&Err(anyhow::anyhow!("bad key"))));
+    }
 
     const KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK6E8nQkaW3MYkgv8GDbIF1VK2MRVfPfT+tEIIpjg6j3 starla";
