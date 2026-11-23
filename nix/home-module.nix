@@ -95,9 +95,12 @@ in
       default = null;
       description = ''
         Path to a file containing the SSH private key (OpenSSH PEM format).
-        When set, starla reads the key from this file via the STARLA_SSH_KEY
-        environment variable instead of generating one in the state directory.
-        Use this to inject keys from password-store, sops, etc.
+        When set, the service passes the path in STARLA_SSH_KEY_FILE and
+        starla reads the key from that file instead of using or generating
+        one in the state directory. Use this to inject keys from
+        password-store, sops, etc. Point it at a file outside your
+        configuration ("/run/user/1000/secrets/probe_key"): a key kept beside
+        a flake's sources ends up in the world-readable Nix store.
       '';
     };
   };
@@ -124,7 +127,7 @@ in
         Restart = "on-failure";
         RestartSec = 10;
       } // lib.optionalAttrs (cfg.sshKeyFile != null) {
-        Environment = [ "STARLA_SSH_KEY=${cfg.sshKeyFile}" ];
+        Environment = [ "STARLA_SSH_KEY_FILE=${toString cfg.sshKeyFile}" ];
       };
 
       Install = {
@@ -183,7 +186,7 @@ in
         HardResourceLimits = { NumberOfFiles = 8192; };
       } // lib.optionalAttrs (cfg.sshKeyFile != null) {
         EnvironmentVariables = {
-          STARLA_SSH_KEY = toString cfg.sshKeyFile;
+          STARLA_SSH_KEY_FILE = toString cfg.sshKeyFile;
         };
       };
     };

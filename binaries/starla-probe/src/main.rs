@@ -742,7 +742,8 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
     // where the user has to go and register something right now.
     let mut generated_key = false;
 
-    // Load SSH key from: env var > systemd credential > file > generate new
+    // Load SSH key from: env var (the key) > env var (its file) > systemd
+    // credential > file > generate new
     let key = if let Ok(pem) = std::env::var("STARLA_SSH_KEY") {
         match starla_controller::load_key_from_string(&pem) {
             Ok(k) => {
@@ -752,6 +753,23 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
             Err(e) => {
                 error!("Failed to parse STARLA_SSH_KEY: {}", e);
                 anyhow::bail!("Invalid STARLA_SSH_KEY");
+            }
+        }
+    } else if let Some(path) = std::env::var_os("STARLA_SSH_KEY_FILE") {
+        // The home-manager module's sshKeyFile: a path, where
+        // STARLA_SSH_KEY holds the key itself
+        let path = std::path::PathBuf::from(path);
+        match starla_controller::load_key(&path).await {
+            Ok(k) => {
+                debug!(
+                    "Loaded SSH key from {} (STARLA_SSH_KEY_FILE)",
+                    path.display()
+                );
+                k
+            }
+            Err(e) => {
+                error!("Failed to load SSH key from {}: {}", path.display(), e);
+                anyhow::bail!("Invalid STARLA_SSH_KEY_FILE");
             }
         }
     } else if let Ok(creds_dir) = std::env::var("CREDENTIALS_DIRECTORY") {
