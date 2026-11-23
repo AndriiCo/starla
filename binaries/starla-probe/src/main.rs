@@ -1166,6 +1166,11 @@ async fn run_probe(background: Background, shutdown: CancellationToken) -> Resul
                                 info!("Controller ready, remote port: {}", remote_port);
                                 con_keep.set_ready(remote_port, session_id.clone());
                                 save_con_keep(&con_keep, &con_keep_path);
+                                // The controller's yes to INIT, as reg_delay
+                                // starts over on the registration server's:
+                                // not on the SSH handshake (#60), and not on a
+                                // cached session, which no controller answered.
+                                ctrl_delay = min_ctrl_delay;
                                 break (remote_port, session_id);
                             }
                             Ok(InitResponse::Wait { timeout_secs }) => {
