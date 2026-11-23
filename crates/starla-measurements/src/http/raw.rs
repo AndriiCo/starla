@@ -448,7 +448,9 @@ async fn attempt(
             return true;
         }
         Err(_) => {
-            out.err = Some("timeout reading status".into());
+            let (err, header) = reader.timed_out(&raw, opts.store_headers);
+            out.err = Some(err);
+            out.header = header;
             return true;
         }
     };
@@ -638,6 +640,11 @@ struct Reader {
     taken: usize,
     /// lineoffset from the response's start: bytes parsed
     parsed: usize,
+    /// Where httpget's line buffer starts in the response: where the parse
+    /// was when get_input last moved what was left unparsed to its start
+    /// (httpget.c:1044-1057). Its linelen is `taken - line`, its
+    /// lineoffset `parsed - line`.
+    line: usize,
     status: u16,
     content_length: Option<usize>,
     chunked: bool,
@@ -671,6 +678,7 @@ impl Reader {
             state: ReadState::Status,
             taken: 0,
             parsed: 0,
+            line: 0,
             status: 0,
             content_length: None,
             chunked: false,
@@ -683,6 +691,7 @@ impl Reader {
     /// get_input: take what has come, as much as the line buffer has room
     /// for (all of it without a limit).
     fn get_input(&mut self, buf: &[u8]) {
+        self.line = self.parsed;
         let room = match self.limit {
             Some(_) => LINE_MAX - (self.taken - self.parsed),
             None => usize::MAX,
@@ -814,6 +823,59 @@ impl Reader {
                 Done => return Some(Stop::End(self.parsed)),
             }
         }
+    }
+
+    /// What timeout_callback reports when the timer ends the reading of
+    /// `raw` (httpget.c:364-403), by where readcb was: the error, and the
+    /// header lines stored by then. In the status line, "timeout reading
+    /// status". In the header, "timeout reading headers" after the header
+    /// lines so far, with no closing "". In a body by its length or to the
+    /// end, "timeout reading body"; in a chunked one, "timeout reading
+    /// chunk: state %ld linelen %ld lineoffset %ld" with readstate's
+    /// number and the line buffer's linelen and lineoffset. Both come after
+    /// the whole header.
+    ///
+    /// The reference's own line is no JSON here: in the header it adds
+    /// `", "err":"timeout reading headers"` after the array's " ], " (or
+    /// after "{ " when it stores none), with no ", " after it. Starla's
+    /// has the same fields, punctuated.
+    ///
+    /// readstate is READ_CHUNKED (5) waiting for a chunk's size line,
+    /// READ_CHUNK_BODY (6) for its data. Waiting, readcb has always just
+    /// called get_input, which moved the unparsed bytes to the line
+    /// buffer's start: linelen is what came of the line being waited for,
+    /// 0 in chunk data, and lineoffset is 0. In the line ending a chunk's
+    /// data or in the trailer (READ_CHUNK_END, 7, and
+    /// READ_CHUNKED_TRAILER, 8) timeout_callback reports nothing at all and
+    /// the fetch never ends (its default case); Starla reports them as the
+    /// chunk states they follow, with their own numbers.
+    fn timed_out(&self, raw: &[u8], store_headers: usize) -> (String, Option<Vec<String>>) {
+        use ReadState::*;
+        let header = || {
+            parse_response(&raw[..self.header_end], store_headers)
+                .ok()
+                .and_then(|p| p.header)
+        };
+        let readstate = match self.state {
+            Status => return ("timeout reading status".into(), None),
+            Header => {
+                return (
+                    "timeout reading headers".into(),
+                    header_so_far(&raw[..self.parsed], store_headers),
+                )
+            }
+            Body | Simple | Done => return ("timeout reading body".into(), header()),
+            Chunked => 5,
+            ChunkBody => 6,
+            ChunkEnd => 7,
+            Trailer => 8,
+        };
+        let err = format!(
+            "timeout reading chunk: state {readstate} linelen {} lineoffset {}",
+            self.taken - self.line,
+            self.parsed - self.line
+        );
+        (err, header())
     }
 }
 
@@ -1722,6 +1784,87 @@ mod tests {
         .await
         .unwrap());
         assert_eq!(out.err.as_deref(), Some("connect: Connection refused"));
+    }
+
+    /// What a fetch from a server that sends `writes` and then holds the
+    /// connection comes to, with --store-headers 1024 and a 500 ms timeout.
+    async fn stalled(writes: &[&[u8]]) -> RawHttpOutcome {
+        let port = paced_server(|_| {}, writes.iter().map(|w| w.to_vec()).collect()).await;
+        let url = parse_http_url(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let started = Instant::now();
+        let out = one(fetch_via(
+            None,
+            anywhere,
+            &url,
+            &opts(4, 1024, Duration::from_millis(500), None),
+        )
+        .await
+        .unwrap());
+        assert!(started.elapsed() < Duration::from_millis(900));
+        assert!(!out.done, "{out:?}");
+        out
+    }
+
+    /// The timer's error says where the reading was, as timeout_callback's
+    /// does (httpget.c:364-403): in the header after the header lines so
+    /// far, with no closing ""; in the body after the whole header; in a
+    /// chunked body with readcb's state and line buffer. Starla said
+    /// "timeout reading status" wherever it was.
+    #[tokio::test]
+    async fn a_timeout_says_where_the_reading_was() {
+        const CHUNKED: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let out = stalled(&[b"HTTP/1.1 200 OK\r\nX-A: 1\r\n", b"X-B: 2\r\nX-C"]).await;
+        assert_eq!(out.err.as_deref(), Some("timeout reading headers"));
+        assert_eq!(out.header.as_deref().unwrap(), ["X-A: 1", "X-B: 2"]);
+        let body = crate::http::result_body(1001, 1, &out);
+        assert!(
+            body.contains(
+                "{ \"header\": [ \"X-A: 1\", \"X-B: 2\" ], \"err\":\"timeout reading headers\", \
+                 \"method\":\"GET\", \"af\": 4, "
+            ),
+            "{body}"
+        );
+        assert!(!body.contains("\"rt\""), "{body}");
+
+        let out = stalled(&[
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n",
+            &[b'x'; 400],
+        ])
+        .await;
+        assert_eq!(out.err.as_deref(), Some("timeout reading body"));
+        assert_eq!(out.header.as_deref().unwrap(), ["Content-Length: 1000", ""]);
+
+        let header = ["Transfer-Encoding: chunked", ""];
+        for (writes, err) in [
+            // in a chunk's data: all of what came parsed
+            (
+                &[CHUNKED, b"5\r\nab"][..],
+                "timeout reading chunk: state 6 linelen 0 lineoffset 0",
+            ),
+            // in a size line, 2 bytes of it come
+            (
+                &[CHUNKED, b"5\r\nabcde\r\n", b"1f"],
+                "timeout reading chunk: state 5 linelen 2 lineoffset 0",
+            ),
+            (
+                &[CHUNKED],
+                "timeout reading chunk: state 5 linelen 0 lineoffset 0",
+            ),
+            // after a chunk's data, and in the trailer, where httpget
+            // reports nothing
+            (
+                &[CHUNKED, b"5\r\nabcde"],
+                "timeout reading chunk: state 7 linelen 0 lineoffset 0",
+            ),
+            (
+                &[CHUNKED, b"0\r\nX-T"],
+                "timeout reading chunk: state 8 linelen 3 lineoffset 0",
+            ),
+        ] {
+            let out = stalled(writes).await;
+            assert_eq!(out.err.as_deref(), Some(err));
+            assert_eq!(out.header.as_deref().unwrap(), header);
+        }
     }
 
     #[test]
