@@ -348,9 +348,12 @@ impl ScheduledTask {
         self.set_timeout(now);
     }
 
-    /// Check if the task has expired (past its end time)
+    /// Whether the line has expired: `now` is past its end time, as
+    /// set_timeout and RunJob test it (eperd.c:741, 1313). An end time of 0
+    /// is long past, and the line never runs; it used to mean no end. A job
+    /// scheduled on its own without one is given none (Lines::schedule).
     pub fn is_expired(&self, now: i64) -> bool {
-        self.end_time > 0 && now > self.end_time
+        now > self.end_time
     }
 
     /// eperd's set_timeout(line, 1) (eperd.c:744-754): the first cycle
@@ -907,6 +910,17 @@ mod tests {
             body.ends_with(r#", "cmd": "a\"b\\c\u0009d\u007f\u00c3\u00a9~ ""#),
             "{body}"
         );
+    }
+
+    /// eperd's line ending at 0 has long expired: Start() sets no timer
+    /// (eperd.c:741), so it never fires.
+    #[test]
+    fn a_line_ending_at_0_has_expired() {
+        let now = 1_791_836_000;
+        let mut t = ScheduledTask::new_at(at(now), 1, 900, 312, 0, 0, job());
+        assert!(t.is_expired(now));
+        assert!(!t.is_due(at(now + 900 * 10)));
+        assert_eq!(t.fire(at(now + 412)), Fired::NotYet);
     }
 
     #[test]

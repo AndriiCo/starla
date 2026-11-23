@@ -1682,6 +1682,15 @@ async fn run_commands(
             ($msm_id:expr, $schedule:expr, $spread:expr,
              $type_name:expr, $metric_name:expr, $measurement_spec:expr) => {{
                 let is_recurring = $schedule.interval > 0;
+                // A crontab's line of interval 0 is no one-shot: eperd
+                // drops it as a "bad crontab line" (eperd.c:573-581), and
+                // ran on every push it would measure on each. A ONEOFF's
+                // command, though parsed as a `CRONLINE 0 …`, comes with
+                // no crontab line (`shell`), and runs once.
+                if !is_recurring && shell.is_some() {
+                    debug!(msm_id = $msm_id, "Bad crontab line, interval 0: not run");
+                    continue;
+                }
                 if is_recurring {
                     debug!(
                         msm_id = $msm_id,
@@ -2796,6 +2805,63 @@ mod tests {
 
         drop(cmd_tx);
         commands.await.unwrap();
+    }
+
+    /// A crontab's line of interval 0 is eperd's "bad crontab line"
+    /// (eperd.c:573-581): not run on each push, nor one of the file's
+    /// lines. A ONEOFF, whose command is parsed as a `CRONLINE 0 …`, still
+    /// runs, once.
+    #[tokio::test]
+    async fn a_crontab_line_of_interval_0_is_dropped_and_a_oneoff_runs() {
+        const EVPING_0: &str = "0 1 2000000000 UNIFORM 120 evping -4 -c 3 -A \"3000001\" \
+                                -O /home/atlas/data/new/7 192.0.2.1";
+        const EVPING: &str = "240 1 2000000000 UNIFORM 120 evping -4 -c 3 -A \"3000000\" \
+                              -O /home/atlas/data/new/7 192.0.2.1";
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let (scheduler_tx, mut scheduler_rx) = mpsc::channel(4);
+        let handler = Arc::new(ResultHandler::new(
+            Box::new(SshUploadTransport {
+                ssh: Arc::new(tokio::sync::Mutex::new(None)),
+            }),
+            UploaderConfig::default(),
+            ResultHandlerConfig::default(),
+            MetricsRegistry::new().unwrap(),
+        ));
+        let commands = tokio::spawn(run_commands(
+            cmd_rx,
+            scheduler_tx,
+            CancellationToken::new(),
+            handler.host_telemetry(),
+            Arc::clone(&handler),
+            MetricsRegistry::new().unwrap(),
+        ));
+
+        cmd_tx
+            .send(crontab_of(
+                "/var/spool/ripe-atlas/crons/7",
+                &[EVPING_0, EVPING],
+            ))
+            .await
+            .unwrap();
+        let Some(SchedulerCommand::Crontab(crons_7)) = scheduler_rx.recv().await else {
+            panic!("no crontab, or a run of the interval-0 line first");
+        };
+        assert_eq!(crons_7.lines.len(), 1);
+        assert_eq!(crons_7.lines[0].job.msm_id, 3000000);
+
+        let oneoff = starla_controller::telnet::parse_command(
+            "ONEOFF /home/atlas/crons/oneoff evping -4 -c 3 -A \"3000002\" 192.0.2.2",
+        );
+        assert!(matches!(oneoff, TelnetCommand::Oneoff(_)), "{oneoff:?}");
+        cmd_tx.send(oneoff).await.unwrap();
+        let Some(SchedulerCommand::ExecuteNow(job)) = scheduler_rx.recv().await else {
+            panic!("the ONEOFF did not run");
+        };
+        assert_eq!((job.msm_id, job.interval), (3000002, 0));
+
+        drop(cmd_tx);
+        commands.await.unwrap();
+        assert!(scheduler_rx.recv().await.is_none(), "nothing else");
     }
 
     /// The main httppost line's --maxpostsize, session 2 of enodia's

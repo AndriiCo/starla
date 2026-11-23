@@ -150,8 +150,24 @@ impl Lines {
     /// starts afresh: the first slot after `now`. The one replaced has
     /// gone, as a crontab line a push leaves out has: a run of it taken and
     /// still sleeping to its microseconds does not start ([`LineGone`]).
+    /// Its end time 0 is none: it runs until stopped, where a crontab's
+    /// line with end time 0 never runs, as eperd's ([`ScheduledTask::is_expired`]).
     pub(crate) fn schedule(&mut self, job: MeasurementJob, now: Now) {
-        if let Some(old) = self.lines.insert(LineKey::Own(job.msm_id), start(job, now)) {
+        let msm_id = job.msm_id;
+        let task = if job.end_time == 0 {
+            ScheduledTask::new_at(
+                now,
+                job.msm_id,
+                job.interval,
+                job.start_time,
+                i64::MAX,
+                job.spread,
+                job,
+            )
+        } else {
+            start(job, now)
+        };
+        if let Some(old) = self.lines.insert(LineKey::Own(msm_id), task) {
             old.gone.set();
         }
         self.changed = true;
@@ -1082,6 +1098,27 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines.line(CRONS_7, &other).is_some());
         assert_eq!(lines.stop(30002), 0);
+    }
+
+    #[test]
+    fn a_crontab_line_ending_at_0_never_runs_and_a_job_of_its_own_does() {
+        let now = 1_791_836_000;
+        let mut lines = Lines::default();
+        // set_timeout and RunJob: now > end_time 0 (eperd.c:741, 1313)
+        let never = ping_line(1, 60, 0, 0, 0, "192.0.2.1");
+        lines.synchronize(crontab(CRONS_7, std::slice::from_ref(&never)), at(now));
+        assert_eq!(lines.len(), 1, "Insert()ed, its timer not set");
+        assert!(runs(&mut lines, now, now + 600).is_empty());
+        // extended, it runs on its slots
+        let mut extended = never;
+        extended.job.end_time = 2_000_000_000;
+        lines.synchronize(crontab(CRONS_7, &[extended]), at(now + 600));
+        assert!(!runs(&mut lines, now + 601, now + 1200).is_empty());
+
+        // SchedulerCommand::Schedule's end time 0 is none
+        let mut lines = Lines::default();
+        lines.schedule(ping_line(2, 60, 0, 0, 0, "192.0.2.2").job, at(now));
+        assert_eq!(runs(&mut lines, now, now + 600).len(), 10);
     }
 
     #[test]

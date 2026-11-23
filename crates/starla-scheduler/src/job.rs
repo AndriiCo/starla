@@ -42,7 +42,9 @@ pub struct MeasurementJob {
     pub interval: u64,
     /// Start time (unix timestamp, 0 = now)
     pub start_time: i64,
-    /// End time (unix timestamp, 0 = never)
+    /// End time (unix timestamp). 0 is none for a job scheduled on its own
+    /// (`SchedulerCommand::Schedule`); a crontab's line with end time 0 has
+    /// expired, as eperd's, and never runs
     pub end_time: i64,
     /// Random spread in seconds
     pub spread: u64,
