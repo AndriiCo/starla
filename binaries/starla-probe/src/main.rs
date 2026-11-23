@@ -1894,6 +1894,13 @@ async fn run_commands(
                 })
             ),
             TelnetCommand::HostTelemetry(spec) => {
+                // As a measurement line: a crontab's line of interval 0 is
+                // eperd's "bad crontab line" (eperd.c:573-581), which ran
+                // on every push. Sent alone (a ONEOFF), it runs once.
+                if spec.interval == 0 && shell.is_some() {
+                    debug!(?spec.kind, "Bad crontab line, interval 0: not run");
+                    continue;
+                }
                 debug!(?spec.kind, interval = spec.interval, "Scheduling host telemetry");
                 match spec.kind {
                     starla_controller::HostTelemetryKind::Buddyinfo => {
@@ -2825,9 +2832,9 @@ mod tests {
         commands.await.unwrap();
     }
 
-    /// A crontab's line of interval 0 is eperd's "bad crontab line"
-    /// (eperd.c:573-581): not run on each push, nor one of the file's
-    /// lines. A ONEOFF, whose command is parsed as a `CRONLINE 0 …`, still
+    /// A crontab's line of interval 0, a measurement's or a telemetry
+    /// line's, is eperd's "bad crontab line" (eperd.c:573-581): not run on
+    /// each push, nor one of the file's lines. A ONEOFF, whose command is parsed as a `CRONLINE 0 …`, still
     /// runs, once.
     #[tokio::test]
     async fn a_crontab_line_of_interval_0_is_dropped_and_a_oneoff_runs() {
@@ -2835,6 +2842,7 @@ mod tests {
                                 -O /home/atlas/data/new/7 192.0.2.1";
         const EVPING: &str = "240 1 2000000000 UNIFORM 120 evping -4 -c 3 -A \"3000000\" \
                               -O /home/atlas/data/new/7 192.0.2.1";
+        const BUDDYINFO_0: &str = "0 1 2000000000 UNIFORM 120 buddyinfo 2048";
         let (cmd_tx, cmd_rx) = mpsc::channel(4);
         let (scheduler_tx, mut scheduler_rx) = mpsc::channel(4);
         let handler = Arc::new(ResultHandler::new(
@@ -2857,7 +2865,7 @@ mod tests {
         cmd_tx
             .send(crontab_of(
                 "/var/spool/ripe-atlas/crons/7",
-                &[EVPING_0, EVPING],
+                &[EVPING_0, BUDDYINFO_0, EVPING],
             ))
             .await
             .unwrap();
@@ -2866,6 +2874,12 @@ mod tests {
         };
         assert_eq!(crons_7.lines.len(), 1);
         assert_eq!(crons_7.lines[0].job.msm_id, 3000000);
+        // Nor the telemetry line of interval 0 (buddyinfo reports only
+        // where there is a /proc/buddyinfo)
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(handler.host_telemetry().drain().await.is_empty());
 
         let oneoff = starla_controller::telnet::parse_command(
             "ONEOFF /home/atlas/crons/oneoff evping -4 -c 3 -A \"3000002\" 192.0.2.2",
