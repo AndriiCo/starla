@@ -91,6 +91,10 @@ struct CrontabReport {
     line: ReportLine,
     /// Sent since crons/main last ended
     sent: bool,
+    /// From crons/main, whose pushes replace it; a line from another
+    /// crontab stays until a line of its kind replaces it, as Starla sees
+    /// only crons/main's end
+    crons_main: bool,
 }
 
 /// Shared state collecting host-telemetry RESULT lines for the next upload.
@@ -103,6 +107,8 @@ pub struct HostTelemetry {
     /// A session has begun: lines scheduled from now on are the
     /// controller's, from its crontabs
     in_session: AtomicBool,
+    /// The crontab being pushed is crons/main ([`crontab_begins`](Self::crontab_begins))
+    in_crons_main: AtomicBool,
     produce: Produce,
     #[cfg(target_os = "linux")]
     rptaddrs_cache: Mutex<RptaddrsCache>,
@@ -114,6 +120,7 @@ impl Default for HostTelemetry {
             pending: Mutex::default(),
             reporters: Mutex::default(),
             in_session: AtomicBool::new(false),
+            in_crons_main: AtomicBool::new(true),
             produce: report_line,
             #[cfg(target_os = "linux")]
             rptaddrs_cache: Mutex::default(),
@@ -209,11 +216,22 @@ impl HostTelemetry {
         let mut reporters = self.reporters.lock().await;
         let reporter = reporters.entry(kind).or_default();
         if self.in_session.load(Ordering::Relaxed) {
-            reporter.crontab = Some(CrontabReport { line, sent: true });
+            reporter.crontab = Some(CrontabReport {
+                line,
+                sent: true,
+                crons_main: self.in_crons_main.load(Ordering::Relaxed),
+            });
         } else {
             reporter.probe = Some(line);
         }
         self.run_counting_line(kind, reporter);
+    }
+
+    /// A crontab push begins; `crons_main` when it is crons/main, the one
+    /// whose end Starla sees and whose lines its pushes replace
+    /// ([`crons_main_ended`](Self::crons_main_ended)).
+    pub fn crontab_begins(&self, crons_main: bool) {
+        self.in_crons_main.store(crons_main, Ordering::Relaxed);
     }
 
     /// A session has begun: the lines scheduled from now on come from the
@@ -226,12 +244,13 @@ impl HostTelemetry {
     /// ended are its lines, and one not sent since stops, as perd and eperd
     /// drop the lines a crontab they read anew no longer has (DeleteFile,
     /// perd.c:555, 720-755; eperd.c:644). The probe's own line of its kind
-    /// then runs again. Only crons/main's end is seen here, so a line that
-    /// another crontab sent in between counts as sent.
+    /// then runs again. Only crons/main's end is seen here, so a line from
+    /// another crontab is none of crons/main's: it stays.
     pub(crate) async fn crons_main_ended(self: &Arc<Self>) {
         let mut reporters = self.reporters.lock().await;
         for (&kind, reporter) in reporters.iter_mut() {
             match &mut reporter.crontab {
+                Some(c) if !c.crons_main => {}
                 Some(c) if c.sent => c.sent = false,
                 Some(c) => {
                     debug!(?kind, line = ?c.line, "telemetry line no longer sent: stopped");
@@ -1436,6 +1455,22 @@ fec00000000000000000000000000001 02 40 40 80     eth0
         assert!(t.running().await.is_empty());
         tokio::time::sleep(Duration::from_secs(3600)).await;
         assert!(reported(&t).await.is_empty(), "stopped");
+    }
+
+    /// A line from another crontab is none of crons/main's: crons/main's
+    /// pushes, which Starla sees end, leave it running. It stopped after
+    /// two of them when its own crontab was not pushed in between.
+    #[tokio::test(start_paused = true)]
+    async fn a_telemetry_line_of_another_crontab_outlasts_crons_mains_pushes() {
+        let t = telemetry();
+        t.session_started();
+        t.crontab_begins(false);
+        t.schedule_buddyinfo(600, Some(2048), None).await;
+        t.crontab_begins(true);
+        for _ in 0..3 {
+            t.crons_main_ended().await;
+        }
+        assert_eq!(t.running().await, [BUDDYINFO]);
     }
 
     /// A changed line replaces the old one: the new reporter reports at

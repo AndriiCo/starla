@@ -1659,6 +1659,9 @@ async fn run_commands(
                     (line.command, shell)
                 }));
                 perd_condmvs = (spec.dir == PERD_CRONTAB).then(Vec::new);
+                // Only crons/main's end is seen: its pushes replace its own
+                // telemetry lines, and no other crontab's
+                host_telemetry.crontab_begins(spec.dir == PERD_CRONTAB);
                 crontab = Some(starla_scheduler::Crontab {
                     file: spec.dir,
                     lines: Vec::new(),
