@@ -226,7 +226,9 @@
           <pre><div class="pre-head"><span class="lang">shell</span><span>docker · podman</span></div><div class="pre-body"><code><span class="c"># persistent state, raw sockets for ping/trace</span>
 docker run -d --name starla \
   -v starla-state:/state \
-  --cap-add NET_RAW \
+  --cap-drop ALL --cap-add NET_RAW \
+  --security-opt no-new-privileges \
+  --read-only --tmpfs /run \
   ghcr.io/ananthb/starla:latest</code></div></pre>
         </div>
 
