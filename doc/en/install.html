@@ -76,10 +76,13 @@
 
       <pre><div class="pre-head"><span class="lang">shell</span><span>persistent state</span></div><div class="pre-body"><code>docker run -d --name starla \
   -v starla-state:/state \
-  --cap-add NET_RAW \
+  --cap-drop ALL --cap-add NET_RAW \
+  --security-opt no-new-privileges \
+  --read-only --tmpfs /run \
   ghcr.io/ananthb/starla:latest</code></div></pre>
 
       <p><code>CAP_NET_RAW</code> is required for ping and traceroute. Without it, only DNS, HTTP, TLS, and NTP measurements will run.</p>
+      <p>The image runs as root inside the container. <code>--cap-drop ALL --cap-add NET_RAW</code> leaves it only the capability it needs, <code>no-new-privileges</code> stops it gaining more, and <code>--read-only --tmpfs /run</code> keeps everything but <code>/state</code> and the status socket's <code>/run</code> unwritable.</p>
       <p>Inside a container, starla automatically writes state to <code>/state</code> and reads config from <code>/config</code>. No extra flags needed.</p>
 
       <h3>With a config file</h3>
@@ -90,7 +93,9 @@ cp config.toml.example config.toml
 docker run -d --name starla \
   -v starla-state:/state \
   -v $(pwd)/config.toml:/config/config.toml:ro \
-  --cap-add NET_RAW \
+  --cap-drop ALL --cap-add NET_RAW \
+  --security-opt no-new-privileges \
+  --read-only --tmpfs /run \
   ghcr.io/ananthb/starla:latest</code></div></pre>
 
       <h3 id="k8s">Stateless / Kubernetes</h3>
@@ -102,7 +107,9 @@ ssh-keygen -t ed25519 -f starla-key -N <span class="s">""</span>
 <span class="c"># run with key in env (no persistent state)</span>
 docker run -d --name starla \
   -e STARLA_SSH_KEY=<span class="s">"$(cat starla-key)"</span> \
-  --cap-add NET_RAW \
+  --cap-drop ALL --cap-add NET_RAW \
+  --security-opt no-new-privileges \
+  --read-only --tmpfs /run --tmpfs /state \
   ghcr.io/ananthb/starla:latest</code></div></pre>
 
       <p>Register the public key (<code>starla-key.pub</code>) at <a href="https://atlas.ripe.net/register/swprobe/">atlas.ripe.net/register/swprobe</a>. The key can be stored as a Kubernetes Secret and mounted as an env var.</p>

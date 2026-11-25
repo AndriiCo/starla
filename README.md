@@ -43,7 +43,9 @@ An alternative unofficial [RIPE Atlas](https://atlas.ripe.net) software probe wr
 # Docker / Podman
 docker run -d --name starla \
   -v starla-state:/state \
-  --cap-add NET_RAW \
+  --cap-drop ALL --cap-add NET_RAW \
+  --security-opt no-new-privileges \
+  --read-only --tmpfs /run \
   ghcr.io/ananthb/starla:latest
 
 # NixOS
