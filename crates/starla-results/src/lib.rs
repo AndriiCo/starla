@@ -44,11 +44,13 @@ pub struct ResultHandlerConfig {
     /// Starla's own upload interval, until the controller's httppost line
     /// arrives
     pub upload_interval: Duration,
-    /// Maximum result age before dropping (seconds). With
-    /// `max_queue_size`, the only bound on results a post has not
-    /// delivered: however many posts fail, they wait for the next one, as
-    /// the reference's spool files do.
-    pub max_result_age_secs: i64,
+    /// Maximum result age before dropping (seconds); None, the default,
+    /// never drops a result for its age. However many posts fail, results
+    /// wait for the next one, as the reference's spool files do: nothing
+    /// in the reference expires them by age, only dfrm empties the spool
+    /// when the disk is nearly full (ripe-atlas.in, dfrm.c).
+    /// `max_queue_size` is Starla's bound in its place.
+    pub max_result_age_secs: Option<i64>,
     /// Cleanup interval for expired results
     pub cleanup_interval: Duration,
     /// Maximum number of results in queue
@@ -65,7 +67,7 @@ impl Default for ResultHandlerConfig {
     fn default() -> Self {
         Self {
             upload_interval: Duration::from_secs(60),
-            max_result_age_secs: 3600,                  // 1 hour
+            max_result_age_secs: None,
             cleanup_interval: Duration::from_secs(300), // 5 minutes
             max_queue_size: 10000,
             rxtxrpt: false,
@@ -955,12 +957,14 @@ impl ResultHandler {
             .await
     }
 
-    /// Drop the results older than `max_result_age_secs`, from both queues:
-    /// with the queues' size, the only bound on results a post has not
-    /// delivered.
+    /// Drop the results older than `max_result_age_secs`, if it is set,
+    /// from both queues: with the queues' size, the only bound on results
+    /// a post has not delivered.
     pub async fn run_cleanup(&self) {
         self.take_submitted().await;
-        let max_age = self.config.max_result_age_secs;
+        let Some(max_age) = self.config.max_result_age_secs else {
+            return;
+        };
         let mut queue = self.queue.lock().await;
         let expired = queue.cleanup_expired(max_age);
         if expired > 0 {
@@ -2360,15 +2364,15 @@ mod tests {
         assert!(main.contains("\"1001\"") && !main.contains("\"7001\""));
     }
 
-    /// What bounds them is their age, `max_result_age_secs`, in both queues
-    /// (and each queue's size).
+    /// A `max_result_age_secs`, when set, bounds them by their age in both
+    /// queues (as each queue's size does).
     #[tokio::test]
     async fn results_past_the_max_age_are_dropped() {
         let handler = ResultHandler::new(
             Box::new(NoopTransport),
             UploaderConfig::default(),
             ResultHandlerConfig {
-                max_result_age_secs: 0,
+                max_result_age_secs: Some(0),
                 ..Default::default()
             },
             starla_metrics::MetricsRegistry::new().unwrap(),
@@ -2379,6 +2383,15 @@ mod tests {
         handler.run_cleanup().await;
         assert_eq!(handler.oneoff_queue.lock().await.stats().count, 0);
         assert_eq!(handler.queue_stats().await.count, 0);
+    }
+
+    /// By default no result is dropped for its age, as the reference's
+    /// spool keeps undelivered results until a post delivers them: on
+    /// 2026-11-24 the one-hour limit dropped probe 1018212's results of a
+    /// two-hour controller outage.
+    #[test]
+    fn results_are_not_dropped_for_their_age_by_default() {
+        assert_eq!(ResultHandlerConfig::default().max_result_age_secs, None);
     }
 
     /// 0007's holds stand on the controller's slots too: refused uploads go

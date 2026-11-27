@@ -123,8 +123,8 @@ impl ResultQueue {
     /// one more attempt counted. However many posts fail — a 429, the SSH
     /// session down, any other answer than OK — they wait for the next one,
     /// as httppost's `--delete-file` only deletes the spool's files on an OK
-    /// (httppost.c:602): only their age (`cleanup_expired`) and the queue's
-    /// size drop them. How many results the size dropped.
+    /// (httppost.c:602): only the queue's size, and their age
+    /// (`cleanup_expired`) where a maximum is set, drop them. How many results the size dropped.
     #[must_use = "a result the queue's size dropped is a queue drop to record"]
     pub fn requeue(&mut self, mut results: Vec<QueuedResult>) -> usize {
         let now = SystemTime::now()

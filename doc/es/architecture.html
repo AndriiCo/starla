@@ -126,7 +126,7 @@
 
       <pre><div class="pre-head"><span class="lang">http</span><span>POST · over SSH channel</span></div><div class="pre-body"><code>POST /?PROBE_ID=12345&amp;SESSION_ID=abc HTTP/1.1 Content-Type: application/x-www-form-urlencoded P_TO_C_REPORT RESULT { <span class="s">"id"</span>:<span class="s">"1001"</span>, <span class="s">"fw"</span>:5120, ... } RESULT { <span class="s">"id"</span>:<span class="s">"1002"</span>, <span class="s">"fw"</span>:5120, ... } SESSION_ID abc</code></div></pre>
 
-      <p>Failed uploads are re-queued with exponential backoff. Results older than one hour or with more than five failed attempts are dropped.</p>
+      <p>Failed uploads are re-queued with exponential backoff. Results wait for a post that delivers them, as the reference probe's spool files do: only a full queue (<code>storage.max_queue_size</code>, 10,000 by default) drops the oldest.</p>
     </section>
 
     <section id="state">
